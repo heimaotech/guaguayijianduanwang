@@ -21,7 +21,7 @@ from pathlib import Path
 #   4. 正常运行时只监听“当前设置的一个按键”
 #   5. 使用 GetAsyncKeyState，独立高优先级线程，不依赖键盘 Hook
 #   6. 修改快捷键时临时扫描所有 VK，完成后立即停止扫描
-#   7. 防火墙只创建本程序自己的两条规则
+#   7. 防火墙预创建本程序自己的两条规则，运行时只启用/禁用
 #   8. 不禁用 Wi-Fi / Ethernet，不修改 IP / DNS / 路由
 # ============================================================
 
@@ -710,32 +710,25 @@ def run_netsh(args):
     return process.stdout.strip()
 
 
-# ============================================================
-# Firewall
-# ============================================================
-
-FIREWALL_GROUP = "GuaguaNetToggle"
 firewall_ready = False
 
 
-def prepare_firewall_rules():
+def _ps_prepare_firewall():
     """
-    启动阶段准备一次防火墙规则：
-    - 规则不存在：创建
-    - 规则存在：修复 Group
-    - 最终统一保持 Disabled
+    只在程序启动阶段执行一次。
 
-    正常断网/恢复过程中不创建、不删除规则。
+    逻辑：
+      - 如果规则不存在，创建它们
+      - 如果规则已经存在，直接复用
+      - 无论之前是什么状态，最后都设为 Disabled
     """
-
-    global firewall_ready
-
     command = f"""
-if (-not (Get-NetFirewallRule -Name '{RULE_OUT}' -ErrorAction SilentlyContinue)) {{
+$ruleOut = Get-NetFirewallRule -Name '{RULE_OUT}' -ErrorAction SilentlyContinue
+
+if (-not $ruleOut) {{
     New-NetFirewallRule `
         -Name '{RULE_OUT}' `
         -DisplayName '{RULE_OUT}' `
-        -Group '{FIREWALL_GROUP}' `
         -Direction Outbound `
         -Action Block `
         -Profile Any `
@@ -744,11 +737,12 @@ if (-not (Get-NetFirewallRule -Name '{RULE_OUT}' -ErrorAction SilentlyContinue))
         -ErrorAction Stop | Out-Null
 }}
 
-if (-not (Get-NetFirewallRule -Name '{RULE_IN}' -ErrorAction SilentlyContinue)) {{
+$ruleIn = Get-NetFirewallRule -Name '{RULE_IN}' -ErrorAction SilentlyContinue
+
+if (-not $ruleIn) {{
     New-NetFirewallRule `
         -Name '{RULE_IN}' `
         -DisplayName '{RULE_IN}' `
-        -Group '{FIREWALL_GROUP}' `
         -Direction Inbound `
         -Action Block `
         -Profile Any `
@@ -759,134 +753,119 @@ if (-not (Get-NetFirewallRule -Name '{RULE_IN}' -ErrorAction SilentlyContinue)) 
 
 Set-NetFirewallRule `
     -Name '{RULE_OUT}','{RULE_IN}' `
-    -Group '{FIREWALL_GROUP}' `
     -Enabled False `
     -ErrorAction Stop
 """
+    run_powershell(command)
 
-    try:
-        run_powershell(command)
-        firewall_ready = True
-        return True
 
-    except Exception:
-        firewall_ready = False
-
-        # 极少数 PowerShell NetSecurity 不可用时使用 netsh
-        # 只在启动/修复阶段使用，不进入正常切换热路径。
+def _netsh_prepare_firewall():
+    """
+    PowerShell 不可用时的备用初始化方式。
+    已存在的规则不重复创建。
+    """
+    for name, direction in (
+        (RULE_OUT, "out"),
+        (RULE_IN, "in"),
+    ):
         try:
-            for name, direction in (
-                (RULE_OUT, "out"),
-                (RULE_IN, "in"),
-            ):
-                changed = False
-
-                try:
-                    run_netsh([
-                        "advfirewall",
-                        "firewall",
-                        "set",
-                        "rule",
-                        f"name={name}",
-                        "new",
-                        "enable=no",
-                        f"group={FIREWALL_GROUP}",
-                    ])
-                    changed = True
-                except Exception:
-                    pass
-
-                if not changed:
-                    run_netsh([
-                        "advfirewall",
-                        "firewall",
-                        "add",
-                        "rule",
-                        f"name={name}",
-                        f"dir={direction}",
-                        "action=block",
-                        "enable=no",
-                        "profile=any",
-                        "protocol=any",
-                        f"group={FIREWALL_GROUP}",
-                    ])
-
-            firewall_ready = True
-            return True
-
+            run_netsh([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={name}",
+                f"dir={direction}",
+                "action=block",
+                "enable=no",
+                "profile=any",
+                "protocol=any",
+            ])
         except Exception:
-            firewall_ready = False
-            return False
+            # 规则已存在时 add 会失败，随后 set 会统一处理。
+            pass
 
-
-def set_firewall_enabled(enabled):
-    """
-    正常运行热路径：
-    只启用/禁用已经存在的防火墙规则。
-
-    优先使用一次 netsh 按 Group 修改两条规则。
-    失败后才回退到一次 PowerShell。
-    """
-
-    global firewall_ready
-
-    state = "yes" if enabled else "no"
-
-    try:
+    for name in (RULE_OUT, RULE_IN):
         run_netsh([
             "advfirewall",
             "firewall",
             "set",
             "rule",
-            f"group={FIREWALL_GROUP}",
+            f"name={name}",
             "new",
-            f"enable={state}",
+            "enable=no",
         ])
 
+
+def prepare_firewall_rules():
+    """
+    程序启动时准备规则。
+    只创建一次；正常断网/恢复不再创建或删除规则。
+    """
+    global firewall_ready
+
+    try:
+        _ps_prepare_firewall()
         firewall_ready = True
         return True
-
-    except Exception as netsh_error:
-
+    except Exception as ps_error:
         try:
-            run_powershell(
-                f"Set-NetFirewallRule "
-                f"-Name '{RULE_OUT}','{RULE_IN}' "
-                f"-Enabled {'True' if enabled else 'False'} "
-                f"-ErrorAction Stop"
-            )
-
+            _netsh_prepare_firewall()
             firewall_ready = True
             return True
-
-        except Exception as ps_error:
-
+        except Exception as netsh_error:
             firewall_ready = False
-
             raise RuntimeError(
-                "Windows 防火墙切换失败。\n"
-                f"netsh: {netsh_error}\n"
-                f"PowerShell: {ps_error}"
+                "无法准备 Windows 防火墙规则。\n"
+                f"PowerShell：{ps_error}\n"
+                f"netsh：{netsh_error}"
             )
 
 
 def cleanup_firewall_rules():
     """
-    程序退出时只禁用本程序规则，不删除。
-
-    这样规则会保留在 Windows 防火墙中，
-    下一次启动无需重新创建。
+    退出/启动时只负责把本程序自己的规则设为 Disabled，
+    不删除规则，这样下一次运行可以直接复用。
     """
+    global firewall_ready
 
     try:
-        set_firewall_enabled(False)
+        run_powershell(
+            f"Set-NetFirewallRule "
+            f"-Name '{RULE_OUT}','{RULE_IN}' "
+            f"-Enabled False "
+            f"-ErrorAction SilentlyContinue"
+        )
+        firewall_ready = True
         return True
     except Exception:
-        return False
+        try:
+            for name in (RULE_OUT, RULE_IN):
+                run_netsh([
+                    "advfirewall",
+                    "firewall",
+                    "set",
+                    "rule",
+                    f"name={name}",
+                    "new",
+                    "enable=no",
+                ])
+            firewall_ready = True
+            return True
+        except Exception:
+            firewall_ready = False
+            return False
 
 
-def block_network():
-    global offline
+def set_firewall_state(enabled):
+    """
+    热路径：
+      enabled=True  -> 立即启用两条预创建规则
+      enabled=False -> 立即禁用两条预创建规则
+
+    正常切换绝不重新创建/删除规则。
+    """
+    global firewall_ready
 
     if not firewall_ready:
         if not prepare_firewall_rules():
@@ -894,22 +873,68 @@ def block_network():
                 "无法准备 Windows 防火墙规则。"
             )
 
-    set_firewall_enabled(True)
+    value = "$true" if enabled else "$false"
+
+    # 首选：一次 PowerShell 进程同时切换两条规则。
+    command = f"""
+Set-NetFirewallRule `
+    -Name '{RULE_OUT}','{RULE_IN}' `
+    -Enabled {value} `
+    -ErrorAction Stop
+"""
+
+    try:
+        run_powershell(command)
+        return
+    except Exception as ps_error:
+
+        # 备用：Windows 原生 netsh，按精确规则名切换。
+        try:
+            state = "yes" if enabled else "no"
+
+            for name in (RULE_OUT, RULE_IN):
+                run_netsh([
+                    "advfirewall",
+                    "firewall",
+                    "set",
+                    "rule",
+                    f"name={name}",
+                    "new",
+                    f"enable={state}",
+                ])
+
+            return
+
+        except Exception as netsh_error:
+
+            raise RuntimeError(
+                "无法切换 Windows 防火墙规则。\n"
+                f"PowerShell：{ps_error}\n"
+                f"netsh：{netsh_error}"
+            )
+
+
+def block_network():
+    """
+    启用预创建的阻断规则。
+    不创建规则，不删除规则，不碰网卡。
+    """
+    global offline
+
+    set_firewall_state(True)
 
     with state_lock:
         offline = True
 
 
 def unblock_network():
+    """
+    禁用预创建的阻断规则。
+    不创建规则，不删除规则，不碰网卡。
+    """
     global offline
 
-    if not firewall_ready:
-        if not prepare_firewall_rules():
-            raise RuntimeError(
-                "无法准备 Windows 防火墙规则。"
-            )
-
-    set_firewall_enabled(False)
+    set_firewall_state(False)
 
     with state_lock:
         offline = False
@@ -2773,11 +2798,16 @@ def main():
 
     # --------------------------------------------------------
     # 启动时只准备一次防火墙规则。
-    # 如果规则已经存在则直接复用，并确保默认关闭。
-    # 不会因为准备失败阻止界面启动。
+    # 已存在则直接复用，并确保初始状态为 Disabled。
     # --------------------------------------------------------
 
-    prepare_firewall_rules()
+    try:
+        prepare_firewall_rules()
+    except Exception as error:
+        show_error(
+            "防火墙初始化失败",
+            str(error),
+        )
 
     # --------------------------------------------------------
     # Window
