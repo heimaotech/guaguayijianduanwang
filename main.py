@@ -122,6 +122,16 @@ VK_ESCAPE = 0x1B
 
 
 # ============================================================
+# GDI / font
+TRANSPARENT = 1
+FW_NORMAL = 400
+FW_SEMIBOLD = 600
+
+# MessageBox flags
+MB_OK = 0x00000000
+MB_ICONERROR = 0x00000010
+MB_ICONWARNING = 0x00000030
+
 # Handle aliases
 # 不使用 wintypes.HCURSOR / HICON / HHOOK 等不存在于部分
 # Python 版本中的类型别名。
