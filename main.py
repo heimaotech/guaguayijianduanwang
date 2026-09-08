@@ -12,26 +12,21 @@ from pathlib import Path
 
 # ============================================================
 # 呱呱一键断网与恢复
-# Windows 原生 Win32 最终稳定版
+# Windows 原生轻量稳定版
 #
-# 正常运行：
-#   Windows RegisterHotKey -> WM_HOTKEY
-#   Windows Shell_NotifyIcon -> 托盘
-#
-# 设置快捷键：
-#   只在设置期间临时使用 GetAsyncKeyState 捕获按键
-#
-# 断网：
-#   Windows Defender Firewall 创建两条专用规则
-#   不关闭 Wi-Fi / Ethernet
-#   不修改 IP / DNS / 路由
-#
-# 第三方 Python 依赖：0
+# 核心设计：
+#   1. 纯 Win32 GUI
+#   2. 原生 Shell_NotifyIcon 托盘
+#   3. 不使用 Tkinter / pystray / Pillow / Qt / Electron
+#   4. 正常运行时只监听“当前设置的一个按键”
+#   5. 使用 GetAsyncKeyState，独立高优先级线程，不依赖键盘 Hook
+#   6. 修改快捷键时临时扫描所有 VK，完成后立即停止扫描
+#   7. 防火墙只创建本程序自己的两条规则
+#   8. 不禁用 Wi-Fi / Ethernet，不修改 IP / DNS / 路由
 # ============================================================
 
 
 APP_NAME = "呱呱一键断网与恢复"
-APP_MUTEX = "Local\\GuaguaNetToggle.SingleInstance"
 
 CONFIG_DIR = (
     Path(os.environ.get("APPDATA", str(Path.home())))
@@ -39,52 +34,50 @@ CONFIG_DIR = (
 )
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+APP_MUTEX = "Local\\GuaguaNetToggle.SingleInstance"
+
 WINDOW_WIDTH = 400
 WINDOW_HEIGHT = 600
 
+# 默认 Home
+DEFAULT_VK = 0x24
+DEFAULT_MOD = 0x0000
+
+# 防火墙规则使用精确 Name。
+# 只操作这两条规则。
 RULE_OUT = "GuaguaNetToggle_Block_Outbound"
 RULE_IN = "GuaguaNetToggle_Block_Inbound"
 
-DEFAULT_VK = 0x24       # Home
-DEFAULT_MOD = 0x0000
+# 控件 ID
+ID_BTN_TOGGLE = 3001
+ID_BTN_HOTKEY = 3002
+ID_BTN_REFRESH = 3003
 
-HOTKEY_ID = 1001
+# 托盘菜单
+ID_TRAY_OPEN = 4001
+ID_TRAY_TOGGLE = 4002
+ID_TRAY_EXIT = 4003
 
-# ------------------------------------------------------------
-# Windows messages
-# ------------------------------------------------------------
-
+# Windows message
 WM_PAINT = 0x000F
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
 WM_HOTKEY = 0x0312
 WM_CTLCOLORSTATIC = 0x0138
-WM_TRAY = 0x8001
-WM_ADAPTER_REFRESH = 0x8002
-WM_CAPTURE_KEY = 0x8003
-WM_SHOW_ERROR = 0x8004
+WM_APP = 0x8000
+WM_UI_REFRESH = WM_APP + 1
+WM_ADAPTER_REFRESH = WM_APP + 2
+WM_CAPTURE_RESULT = WM_APP + 3
+WM_ERROR = WM_APP + 4
+WM_TRAY = WM_APP + 5
 
-# ------------------------------------------------------------
-# Controls
-# ------------------------------------------------------------
+# 托盘事件
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONUP = 0x0205
+WM_LBUTTONDBLCLK = 0x0203
 
-ID_BTN_TOGGLE = 3001
-ID_BTN_HOTKEY = 3002
-ID_BTN_REFRESH = 3003
-
-# ------------------------------------------------------------
-# Tray
-# ------------------------------------------------------------
-
-ID_TRAY_OPEN = 2001
-ID_TRAY_TOGGLE = 2002
-ID_TRAY_EXIT = 2003
-
-# ------------------------------------------------------------
-# Window styles
-# ------------------------------------------------------------
-
+# 窗口样式
 WS_OVERLAPPED = 0x00000000
 WS_CAPTION = 0x00C00000
 WS_SYSMENU = 0x00080000
@@ -96,12 +89,13 @@ WS_EX_APPWINDOW = 0x00040000
 
 BS_PUSHBUTTON = 0x00000000
 BS_DEFPUSHBUTTON = 0x00000001
-
 SS_LEFT = 0x00000000
 SS_LEFTNOWORDWRAP = 0x00000C00
 
 SW_HIDE = 0
 SW_SHOWNORMAL = 1
+
+CW_USEDEFAULT = 0x80000000
 
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
@@ -109,37 +103,28 @@ SM_CYSCREEN = 1
 IDI_APPLICATION = 32512
 IDC_ARROW = 32512
 
-DEFAULT_GUI_FONT = 17
-
-# ------------------------------------------------------------
-# Hotkey modifiers
-# ------------------------------------------------------------
-
+# 热键修饰键（用于保存/显示）
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
-MOD_NOREPEAT = 0x4000
 
-# ------------------------------------------------------------
-# MessageBox
-# ------------------------------------------------------------
+# 线程优先级
+THREAD_PRIORITY_HIGHEST = 2
 
-MB_OK = 0x00000000
-MB_ICONERROR = 0x00000010
-MB_ICONWARNING = 0x00000030
-
-# ------------------------------------------------------------
-# GDI
-# ------------------------------------------------------------
-
-TRANSPARENT = 1
-FW_NORMAL = 400
-FW_SEMIBOLD = 600
+# 单键修饰符 VK
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_ALT = 0x12
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+VK_ESCAPE = 0x1B
 
 
 # ============================================================
 # Handle aliases
+# 不使用 wintypes.HCURSOR / HICON / HHOOK 等不存在于部分
+# Python 版本中的类型别名。
 # ============================================================
 
 HANDLE = ctypes.c_void_p
@@ -152,6 +137,7 @@ HBRUSH = HANDLE
 HFONT = HANDLE
 HGDIOBJ = HANDLE
 HMENU = HANDLE
+HDC = HANDLE
 
 LRESULT = ctypes.c_ssize_t
 ULONG_PTR = ctypes.c_size_t
@@ -190,7 +176,7 @@ class MSG(ctypes.Structure):
 
 class PAINTSTRUCT(ctypes.Structure):
     _fields_ = [
-        ("hdc", HANDLE),
+        ("hdc", HDC),
         ("fErase", wintypes.BOOL),
         ("rcPaint", RECT),
         ("fRestore", wintypes.BOOL),
@@ -293,7 +279,7 @@ gdi32 = ctypes.WinDLL(
 
 
 # ============================================================
-# API declarations
+# Win32 API declarations
 # ============================================================
 
 user32.RegisterClassExW.argtypes = [
@@ -317,9 +303,7 @@ user32.CreateWindowExW.argtypes = [
 ]
 user32.CreateWindowExW.restype = HWND
 
-user32.DestroyWindow.argtypes = [
-    HWND
-]
+user32.DestroyWindow.argtypes = [HWND]
 user32.DestroyWindow.restype = wintypes.BOOL
 
 user32.DefWindowProcW.argtypes = [
@@ -372,44 +356,6 @@ user32.InvalidateRect.argtypes = [
 ]
 user32.InvalidateRect.restype = wintypes.BOOL
 
-user32.BeginPaint.argtypes = [
-    HWND,
-    ctypes.POINTER(PAINTSTRUCT),
-]
-user32.BeginPaint.restype = HANDLE
-
-user32.EndPaint.argtypes = [
-    HWND,
-    ctypes.POINTER(PAINTSTRUCT),
-]
-user32.EndPaint.restype = wintypes.BOOL
-
-user32.FillRect.argtypes = [
-    HANDLE,
-    ctypes.POINTER(RECT),
-    HBRUSH,
-]
-user32.FillRect.restype = ctypes.c_int
-
-user32.GetClientRect.argtypes = [
-    HWND,
-    ctypes.POINTER(RECT),
-]
-user32.GetClientRect.restype = wintypes.BOOL
-
-user32.GetSystemMetrics.argtypes = [
-    ctypes.c_int
-]
-user32.GetSystemMetrics.restype = ctypes.c_int
-
-user32.AdjustWindowRectEx.argtypes = [
-    ctypes.POINTER(RECT),
-    wintypes.DWORD,
-    wintypes.BOOL,
-    wintypes.DWORD,
-]
-user32.AdjustWindowRectEx.restype = wintypes.BOOL
-
 user32.GetMessageW.argtypes = [
     ctypes.POINTER(MSG),
     HWND,
@@ -438,20 +384,6 @@ user32.PostMessageW.argtypes = [
 ]
 user32.PostMessageW.restype = wintypes.BOOL
 
-user32.RegisterHotKey.argtypes = [
-    HWND,
-    ctypes.c_int,
-    wintypes.UINT,
-    wintypes.UINT,
-]
-user32.RegisterHotKey.restype = wintypes.BOOL
-
-user32.UnregisterHotKey.argtypes = [
-    HWND,
-    ctypes.c_int,
-]
-user32.UnregisterHotKey.restype = wintypes.BOOL
-
 user32.GetAsyncKeyState.argtypes = [
     ctypes.c_int
 ]
@@ -462,6 +394,19 @@ user32.GetCursorPos.argtypes = [
 ]
 user32.GetCursorPos.restype = wintypes.BOOL
 
+user32.GetSystemMetrics.argtypes = [
+    ctypes.c_int
+]
+user32.GetSystemMetrics.restype = ctypes.c_int
+
+user32.AdjustWindowRectEx.argtypes = [
+    ctypes.POINTER(RECT),
+    wintypes.DWORD,
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
+user32.AdjustWindowRectEx.restype = wintypes.BOOL
+
 user32.MessageBoxW.argtypes = [
     HWND,
     wintypes.LPCWSTR,
@@ -469,11 +414,6 @@ user32.MessageBoxW.argtypes = [
     wintypes.UINT,
 ]
 user32.MessageBoxW.restype = ctypes.c_int
-
-user32.RegisterWindowMessageW.argtypes = [
-    wintypes.LPCWSTR,
-]
-user32.RegisterWindowMessageW.restype = wintypes.UINT
 
 user32.LoadIconW.argtypes = [
     HINSTANCE,
@@ -514,6 +454,12 @@ user32.DestroyMenu.argtypes = [
 ]
 user32.DestroyMenu.restype = wintypes.BOOL
 
+user32.EnableWindow.argtypes = [
+    HWND,
+    wintypes.BOOL,
+]
+user32.EnableWindow.restype = wintypes.BOOL
+
 kernel32.GetModuleHandleW.argtypes = [
     wintypes.LPCWSTR
 ]
@@ -533,6 +479,15 @@ kernel32.CloseHandle.argtypes = [
     HANDLE
 ]
 kernel32.CloseHandle.restype = wintypes.BOOL
+
+kernel32.GetCurrentThread.argtypes = []
+kernel32.GetCurrentThread.restype = HANDLE
+
+kernel32.SetThreadPriority.argtypes = [
+    HANDLE,
+    ctypes.c_int,
+]
+kernel32.SetThreadPriority.restype = wintypes.BOOL
 
 kernel32.Sleep.argtypes = [
     wintypes.DWORD
@@ -561,16 +516,41 @@ gdi32.DeleteObject.argtypes = [
 gdi32.DeleteObject.restype = wintypes.BOOL
 
 gdi32.SetBkMode.argtypes = [
-    HANDLE,
+    HDC,
     ctypes.c_int,
 ]
 gdi32.SetBkMode.restype = ctypes.c_int
 
 gdi32.SetTextColor.argtypes = [
-    HANDLE,
+    HDC,
     wintypes.COLORREF,
 ]
 gdi32.SetTextColor.restype = wintypes.COLORREF
+
+user32.FillRect.argtypes = [
+    HDC,
+    ctypes.POINTER(RECT),
+    HBRUSH,
+]
+user32.FillRect.restype = ctypes.c_int
+
+user32.GetClientRect.argtypes = [
+    HWND,
+    ctypes.POINTER(RECT)
+]
+user32.GetClientRect.restype = wintypes.BOOL
+
+user32.BeginPaint.argtypes = [
+    HWND,
+    ctypes.POINTER(PAINTSTRUCT),
+]
+user32.BeginPaint.restype = HDC
+
+user32.EndPaint.argtypes = [
+    HWND,
+    ctypes.POINTER(PAINTSTRUCT),
+]
+user32.EndPaint.restype = wintypes.BOOL
 
 
 # ============================================================
@@ -578,6 +558,7 @@ gdi32.SetTextColor.restype = wintypes.COLORREF
 # ============================================================
 
 main_hwnd = None
+
 status_hwnd = None
 detail_hwnd = None
 hotkey_hwnd = None
@@ -587,6 +568,9 @@ admin_hwnd = None
 toggle_button = None
 hotkey_button = None
 refresh_button = None
+
+background_brush = None
+font_handles = []
 
 tray_added = False
 
@@ -601,42 +585,56 @@ hotkey_mod = DEFAULT_MOD
 adapter_text_pending = None
 pending_error = None
 
+state_lock = threading.RLock()
 adapter_lock = threading.Lock()
 error_lock = threading.Lock()
-state_lock = threading.RLock()
 
 mutex_handle = None
-background_brush = None
 
-font_handles = []
+# 键盘线程控制
+keyboard_thread = None
+keyboard_stop = threading.Event()
 
-CLASS_NAME = "GuaguaNetToggleNativeV2"
+# 修改快捷键后，需要等当前按键释放，防止立即触发。
+hotkey_wait_release = True
 
-TASKBAR_CREATED = user32.RegisterWindowMessageW(
-    "TaskbarCreated"
-)
-
-
-# ============================================================
-# Colors
-# COLORREF 0x00BBGGRR
-# ============================================================
-
-COLOR_BG = 0x00F7F7F7
-COLOR_TEXT = 0x001D1D1F
-COLOR_SECONDARY = 0x006E6E73
-COLOR_GREEN = 0x0034C759
-COLOR_RED = 0x003B3BFF
+CLASS_NAME = "GuaguaNetToggleNativeStable"
 
 
 # ============================================================
-# Utility
+# Basic helpers
 # ============================================================
 
 def make_int_resource(value):
     return ctypes.cast(
         ctypes.c_void_p(value),
         wintypes.LPCWSTR,
+    )
+
+
+def set_text(hwnd, text):
+    if hwnd:
+        user32.SetWindowTextW(
+            hwnd,
+            str(text),
+        )
+
+
+def show_error(title, text):
+    user32.MessageBoxW(
+        main_hwnd,
+        str(text),
+        title,
+        MB_OK | MB_ICONERROR,
+    )
+
+
+def show_warning(title, text):
+    user32.MessageBoxW(
+        main_hwnd,
+        str(text),
+        title,
+        MB_OK | MB_ICONWARNING,
     )
 
 
@@ -649,40 +647,11 @@ def is_admin():
         return False
 
 
-def set_text(hwnd, text):
-    if hwnd:
-        user32.SetWindowTextW(
-            hwnd,
-            str(text),
-        )
-
-
-def show_error(title, text):
-
-    user32.MessageBoxW(
-        main_hwnd,
-        str(text),
-        title,
-        MB_OK | MB_ICONERROR,
-    )
-
-
-def show_warning(title, text):
-
-    user32.MessageBoxW(
-        main_hwnd,
-        str(text),
-        title,
-        MB_OK | MB_ICONWARNING,
-    )
-
-
 # ============================================================
-# PowerShell
+# PowerShell + firewall
 # ============================================================
 
 def run_powershell(command):
-
     process = subprocess.run(
         [
             "powershell.exe",
@@ -702,62 +671,94 @@ def run_powershell(command):
     )
 
     if process.returncode != 0:
-
-        error = process.stderr.strip()
-
         raise RuntimeError(
-            error or "PowerShell 执行失败"
+            process.stderr.strip()
+            or "PowerShell 执行失败"
         )
 
     return process.stdout.strip()
 
 
-# ============================================================
-# Firewall
-# ============================================================
+def run_netsh(args):
+    process = subprocess.run(
+        ["netsh", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
 
-def cleanup_rules():
+    if process.returncode != 0:
+        raise RuntimeError(
+            process.stderr.strip()
+            or process.stdout.strip()
+            or "netsh 执行失败"
+        )
+
+    return process.stdout.strip()
+
+
+def cleanup_firewall_rules():
+    """
+    只清理本程序自己的规则。
+    启动时失败不会阻止程序启动。
+    """
+
+    ps_ok = False
 
     try:
-
         run_powershell(
-            f"Get-NetFirewallRule "
-            f"-DisplayName '{RULE_OUT}' "
-            f"-ErrorAction SilentlyContinue | "
-            f"Remove-NetFirewallRule "
-            f"-ErrorAction SilentlyContinue; "
-            f"Get-NetFirewallRule "
-            f"-DisplayName '{RULE_IN}' "
+            f"Get-NetFirewallRule -Name '{RULE_OUT}','{RULE_IN}' "
             f"-ErrorAction SilentlyContinue | "
             f"Remove-NetFirewallRule "
             f"-ErrorAction SilentlyContinue"
         )
-
-        return True
-
+        ps_ok = True
     except Exception:
+        pass
 
-        return False
+    # PowerShell 失败时，再用 Windows 自带 netsh 清理。
+    try:
+        run_netsh([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            f"name={RULE_OUT}",
+        ])
+    except Exception:
+        pass
+
+    try:
+        run_netsh([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            f"name={RULE_IN}",
+        ])
+    except Exception:
+        pass
+
+    return ps_ok
 
 
 def block_network():
+    """
+    创建两条系统级防火墙规则：
+        Outbound Block
+        Inbound Block
 
-    global offline
+    不触碰任何网络适配器。
+    """
 
-    command = f"""
-Get-NetFirewallRule `
-    -DisplayName '{RULE_OUT}' `
-    -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule `
-    -ErrorAction SilentlyContinue
+    cleanup_firewall_rules()
 
-Get-NetFirewallRule `
-    -DisplayName '{RULE_IN}' `
-    -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule `
-    -ErrorAction SilentlyContinue
-
+    ps_command = f"""
 New-NetFirewallRule `
+    -Name '{RULE_OUT}' `
     -DisplayName '{RULE_OUT}' `
     -Direction Outbound `
     -Action Block `
@@ -766,6 +767,7 @@ New-NetFirewallRule `
     -ErrorAction Stop | Out-Null
 
 New-NetFirewallRule `
+    -Name '{RULE_IN}' `
     -DisplayName '{RULE_IN}' `
     -Direction Inbound `
     -Action Block `
@@ -777,64 +779,141 @@ New-NetFirewallRule `
     try:
 
         run_powershell(
-            command
+            ps_command
         )
 
     except Exception:
 
-        cleanup_rules()
+        # 如果 PowerShell 不可用，用 Windows 原生 netsh。
+        try:
 
-        raise
+            run_netsh([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={RULE_OUT}",
+                "dir=out",
+                "action=block",
+                "enable=yes",
+                "profile=any",
+            ])
 
-    with state_lock:
-        offline = True
+            run_netsh([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name={RULE_IN}",
+                "dir=in",
+                "action=block",
+                "enable=yes",
+                "profile=any",
+            ])
+
+        except Exception:
+
+            cleanup_firewall_rules()
+            raise
+
+    return True
 
 
 def unblock_network():
+    """
+    删除本程序自己的两条规则。
+    如果第一种方式失败，会继续尝试 netsh。
+    """
 
-    run_powershell(
-        f"Get-NetFirewallRule "
-        f"-DisplayName '{RULE_OUT}' "
-        f"-ErrorAction SilentlyContinue | "
-        f"Remove-NetFirewallRule "
-        f"-ErrorAction SilentlyContinue; "
-        f"Get-NetFirewallRule "
-        f"-DisplayName '{RULE_IN}' "
-        f"-ErrorAction SilentlyContinue | "
-        f"Remove-NetFirewallRule "
-        f"-ErrorAction SilentlyContinue"
+    ps_error = None
+
+    try:
+
+        run_powershell(
+            f"Get-NetFirewallRule "
+            f"-Name '{RULE_OUT}','{RULE_IN}' "
+            f"-ErrorAction SilentlyContinue | "
+            f"Remove-NetFirewallRule "
+            f"-ErrorAction Stop"
+        )
+
+        return True
+
+    except Exception as error:
+
+        ps_error = error
+
+    # netsh fallback
+    success = True
+
+    for name in (
+        RULE_OUT,
+        RULE_IN,
+    ):
+
+        try:
+
+            run_netsh([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                f"name={name}",
+            ])
+
+        except Exception:
+
+            success = False
+
+    if success:
+        return True
+
+    raise RuntimeError(
+        str(ps_error)
+        if ps_error
+        else "无法删除呱呱创建的防火墙规则。"
     )
 
-    with state_lock:
-        offline = False
 
+# ============================================================
+# Network toggle worker
+# ============================================================
 
 def toggle_worker():
 
     global busy
+    global offline
     global pending_error
 
     try:
 
         with state_lock:
-            should_unblock = offline
+            current = offline
 
-        if should_unblock:
+        if current:
+
             unblock_network()
+
+            with state_lock:
+                offline = False
+
         else:
+
             block_network()
+
+            with state_lock:
+                offline = True
 
     except Exception as error:
 
         with error_lock:
-            pending_error = str(
-                error
-            )
+            pending_error = str(error)
 
         if main_hwnd:
+
             user32.PostMessageW(
                 main_hwnd,
-                WM_SHOW_ERROR,
+                WM_ERROR,
                 0,
                 0,
             )
@@ -845,6 +924,7 @@ def toggle_worker():
             busy = False
 
         if main_hwnd:
+
             user32.PostMessageW(
                 main_hwnd,
                 WM_UI_REFRESH,
@@ -859,7 +939,7 @@ def toggle_async():
 
     with state_lock:
 
-        if busy:
+        if busy or shutdown_requested:
             return
 
         busy = True
@@ -874,7 +954,7 @@ def toggle_async():
 
 
 # ============================================================
-# Network adapters
+# Adapter information
 # ============================================================
 
 def read_adapters():
@@ -934,7 +1014,7 @@ def read_adapters():
     except Exception as error:
 
         return (
-            f"读取网络适配器失败：{error}"
+            f"读取适配器失败：{error}"
         )
 
 
@@ -947,7 +1027,6 @@ def refresh_adapters_async():
         text = read_adapters()
 
         with adapter_lock:
-
             adapter_text_pending = text
 
         if main_hwnd:
@@ -1002,7 +1081,23 @@ def load_config():
         else:
             hotkey_vk = DEFAULT_VK
 
-        hotkey_mod = mod & 0x0F
+        hotkey_mod = mod & (
+            MOD_ALT
+            | MOD_CONTROL
+            | MOD_SHIFT
+            | MOD_WIN
+        )
+
+        # 修饰键不能作为目标键本身。
+        if hotkey_vk in (
+            VK_SHIFT,
+            VK_CONTROL,
+            VK_ALT,
+            VK_LWIN,
+            VK_RWIN,
+        ):
+            hotkey_vk = DEFAULT_VK
+            hotkey_mod = DEFAULT_MOD
 
     except Exception:
 
@@ -1052,17 +1147,21 @@ SPECIAL_KEYS = {
     0x0D: "Enter",
     0x1B: "Esc",
     0x20: "Space",
+
     0x21: "Page Up",
     0x22: "Page Down",
     0x23: "End",
     0x24: "Home",
+
     0x25: "Left",
     0x26: "Up",
     0x27: "Right",
     0x28: "Down",
+
     0x2C: "Print Screen",
     0x2D: "Insert",
     0x2E: "Delete",
+
     0x5B: "Left Win",
     0x5C: "Right Win",
     0x5D: "Menu",
@@ -1077,6 +1176,7 @@ SPECIAL_KEYS = {
     0x67: "Num 7",
     0x68: "Num 8",
     0x69: "Num 9",
+
     0x6A: "Num *",
     0x6B: "Num +",
     0x6D: "Num -",
@@ -1090,7 +1190,6 @@ SPECIAL_KEYS = {
     0x74: "F5",
     0x75: "F6",
     0x76: "F7",
-    0x77: "F8",
     0x78: "F9",
     0x79: "F10",
     0x7A: "F11",
@@ -1161,6 +1260,9 @@ def key_name(vk):
     if 0x41 <= vk <= 0x5A:
         return chr(vk)
 
+    if 0x70 <= vk <= 0x87:
+        return f"F{vk - 0x6F}"
+
     return f"VK {vk}"
 
 
@@ -1194,28 +1296,31 @@ def current_modifiers():
     modifiers = 0
 
     if user32.GetAsyncKeyState(
-        0x11
+        VK_CONTROL
     ) & 0x8000:
 
         modifiers |= MOD_CONTROL
 
     if user32.GetAsyncKeyState(
-        0x12
+        VK_ALT
     ) & 0x8000:
 
         modifiers |= MOD_ALT
 
     if user32.GetAsyncKeyState(
-        0x10
+        VK_SHIFT
     ) & 0x8000:
 
         modifiers |= MOD_SHIFT
 
     if (
-        user32.GetAsyncKeyState(0x5B)
-        & 0x8000
-        or user32.GetAsyncKeyState(0x5C)
-        & 0x8000
+        user32.GetAsyncKeyState(
+            VK_LWIN
+        ) & 0x8000
+        or
+        user32.GetAsyncKeyState(
+            VK_RWIN
+        ) & 0x8000
     ):
 
         modifiers |= MOD_WIN
@@ -1224,51 +1329,201 @@ def current_modifiers():
 
 
 # ============================================================
-# RegisterHotKey
+# High-priority keyboard polling
 # ============================================================
 
-def register_hotkey(
-    vk=None,
-    modifiers=None,
-):
-
-    if vk is None:
-        vk = hotkey_vk
-
-    if modifiers is None:
-        modifiers = hotkey_mod
-
-    user32.UnregisterHotKey(
-        main_hwnd,
-        HOTKEY_ID,
-    )
+def key_is_down(vk):
 
     return bool(
-        user32.RegisterHotKey(
-            main_hwnd,
-            HOTKEY_ID,
-            modifiers | MOD_NOREPEAT,
-            vk,
-        )
+        user32.GetAsyncKeyState(
+            int(vk)
+        ) & 0x8000
     )
 
 
+def capture_keys_pressed():
+
+    result = []
+
+    for vk in range(8, 256):
+
+        if key_is_down(vk):
+            result.append(vk)
+
+    return result
+
+
+def keyboard_worker():
+
+    global hotkey_wait_release
+
+    # 只提升这个轻量线程的调度优先级。
+    # 不是 REALTIME，不会把系统变成高优先级进程。
+    try:
+
+        kernel32.SetThreadPriority(
+            kernel32.GetCurrentThread(),
+            THREAD_PRIORITY_HIGHEST,
+        )
+
+    except Exception:
+        pass
+
+    previous_target_down = False
+    previous_any = set()
+
+    while not keyboard_stop.is_set():
+
+        # ----------------------------------------------------
+        # 快捷键设置模式
+        # ----------------------------------------------------
+
+        if capture_mode:
+
+            current = set(
+                capture_keys_pressed()
+            )
+
+            newly_pressed = (
+                current - previous_any
+            )
+
+            if newly_pressed:
+
+                # Esc 单独按下 = 取消
+                if (
+                    VK_ESCAPE in newly_pressed
+                    and current_modifiers() == 0
+                ):
+
+                    user32.PostMessageW(
+                        main_hwnd,
+                        WM_CAPTURE_RESULT,
+                        VK_ESCAPE,
+                        0,
+                    )
+
+                    previous_any = current
+                    time.sleep(0.008)
+                    continue
+
+                candidates = [
+                    vk
+                    for vk in newly_pressed
+                    if vk not in (
+                        VK_SHIFT,
+                        VK_CONTROL,
+                        VK_ALT,
+                        VK_LWIN,
+                        VK_RWIN,
+                    )
+                ]
+
+                if candidates:
+
+                    vk = min(
+                        candidates
+                    )
+
+                    modifiers = (
+                        current_modifiers()
+                    )
+
+                    user32.PostMessageW(
+                        main_hwnd,
+                        WM_CAPTURE_RESULT,
+                        vk,
+                        modifiers,
+                    )
+
+                    previous_any = current
+                    time.sleep(0.008)
+                    continue
+
+            previous_any = current
+
+            time.sleep(0.008)
+            continue
+
+        # ----------------------------------------------------
+        # 正常运行
+        # ----------------------------------------------------
+
+        with state_lock:
+
+            target_vk = hotkey_vk
+            target_mod = hotkey_mod
+
+        current_down = key_is_down(
+            target_vk
+        )
+
+        if not current_down:
+
+            hotkey_wait_release = False
+
+        elif (
+            current_down
+            and not previous_target_down
+            and not hotkey_wait_release
+        ):
+
+            current_mod = (
+                current_modifiers()
+            )
+
+            # 要求修饰键完全匹配。
+            if current_mod == target_mod:
+
+                toggle_async()
+
+                hotkey_wait_release = True
+
+        previous_target_down = (
+            current_down
+        )
+
+        time.sleep(0.008)
+
+
+def start_keyboard_thread():
+
+    global keyboard_thread
+
+    keyboard_stop.clear()
+
+    keyboard_thread = threading.Thread(
+        target=keyboard_worker,
+        name="GuaguaKeyboardPriority",
+        daemon=True,
+    )
+
+    keyboard_thread.start()
+
+
+def stop_keyboard_thread():
+
+    keyboard_stop.set()
+
+
 # ============================================================
-# Shortcut capture
+# Shortcut UI
 # ============================================================
 
 def begin_capture():
 
     global capture_mode
+    global hotkey_wait_release
 
     if capture_mode:
         return
 
     capture_mode = True
+    hotkey_wait_release = True
 
     set_text(
         hotkey_button,
-        "请按键",
+        "按键中…",
     )
 
     set_text(
@@ -1280,103 +1535,6 @@ def begin_capture():
         main_hwnd
     )
 
-    threading.Thread(
-        target=capture_watcher,
-        name="GuaguaHotkeyCapture",
-        daemon=True,
-    ).start()
-
-
-def capture_watcher():
-
-    previous = set()
-
-    # 第一次读取，防止点击“修改”时鼠标动作/原有键状态被误判。
-    for vk in range(8, 256):
-
-        try:
-
-            if (
-                user32.GetAsyncKeyState(vk)
-                & 0x8000
-            ):
-
-                previous.add(vk)
-
-        except Exception:
-            pass
-
-    while capture_mode:
-
-        current = set()
-
-        for vk in range(8, 256):
-
-            try:
-
-                if (
-                    user32.GetAsyncKeyState(vk)
-                    & 0x8000
-                ):
-
-                    current.add(vk)
-
-            except Exception:
-                pass
-
-        newly_pressed = (
-            current - previous
-        )
-
-        if newly_pressed:
-
-            modifiers = current_modifiers()
-
-            candidates = [
-                vk
-                for vk in newly_pressed
-                if vk not in (
-                    0x10,
-                    0x11,
-                    0x12,
-                    0x5B,
-                    0x5C,
-                )
-            ]
-
-            # Escape 单独按下用于取消。
-            if 0x1B in candidates and modifiers == 0:
-
-                user32.PostMessageW(
-                    main_hwnd,
-                    WM_CAPTURE_KEY,
-                    0x1B,
-                    0,
-                )
-
-                return
-
-            if candidates:
-
-                vk = min(
-                    candidates
-                )
-
-                user32.PostMessageW(
-                    main_hwnd,
-                    WM_CAPTURE_KEY,
-                    vk,
-                    modifiers,
-                )
-
-                return
-
-        previous = current
-
-        kernel32.Sleep(
-            8
-        )
-
 
 def finish_capture(
     vk,
@@ -1386,12 +1544,14 @@ def finish_capture(
     global capture_mode
     global hotkey_vk
     global hotkey_mod
+    global hotkey_wait_release
 
     if not capture_mode:
         return
 
+    # Esc 取消
     if (
-        vk == 0x1B
+        vk == VK_ESCAPE
         and modifiers == 0
     ):
 
@@ -1406,48 +1566,19 @@ def finish_capture(
 
         return
 
+    # 不能单独选择修饰键。
     if vk in (
-        0x10,
-        0x11,
-        0x12,
-        0x5B,
-        0x5C,
+        VK_SHIFT,
+        VK_CONTROL,
+        VK_ALT,
+        VK_LWIN,
+        VK_RWIN,
     ):
 
         return
 
     old_vk = hotkey_vk
     old_mod = hotkey_mod
-
-    if not register_hotkey(
-        vk,
-        modifiers,
-    ):
-
-        # 恢复旧快捷键。
-        register_hotkey(
-            old_vk,
-            old_mod,
-        )
-
-        capture_mode = False
-
-        set_text(
-            hotkey_button,
-            "修改",
-        )
-
-        set_text(
-            hotkey_hwnd,
-            hotkey_display(),
-        )
-
-        show_warning(
-            "快捷键不可用",
-            "这个快捷键已被 Windows 或其他程序占用，请换一个。",
-        )
-
-        return
 
     hotkey_vk = int(vk)
     hotkey_mod = int(
@@ -1458,22 +1589,20 @@ def finish_capture(
 
         save_config()
 
-    except Exception as error:
+    except Exception:
 
         hotkey_vk = old_vk
         hotkey_mod = old_mod
 
-        register_hotkey(
-            old_vk,
-            old_mod,
-        )
-
         show_error(
-            "快捷键保存失败",
-            str(error),
+            "保存失败",
+            "快捷键配置无法保存。",
         )
 
     capture_mode = False
+
+    # 当前键必须释放后才重新允许触发。
+    hotkey_wait_release = True
 
     set_text(
         hotkey_button,
@@ -1484,7 +1613,7 @@ def finish_capture(
 
 
 # ============================================================
-# UI
+# Native font / UI
 # ============================================================
 
 def create_font(
@@ -1492,20 +1621,24 @@ def create_font(
     weight=FW_NORMAL,
 ):
 
-    lf = LOGFONTW()
+    font = LOGFONTW()
 
-    lf.lfHeight = -size
-    lf.lfWeight = weight
-    lf.lfCharSet = 134
-    lf.lfQuality = 5
-    lf.lfPitchAndFamily = 0
+    font.lfHeight = -size
+    font.lfWeight = weight
+    font.lfCharSet = 134
+    font.lfQuality = 5
+    font.lfPitchAndFamily = 0
 
-    # Windows 标准 UI 字体。
-    # 中文系统如不存在对应字形时由 Windows 自动字体回退。
-    lf.lfFaceName = "Segoe UI"
+    # Windows UI 标准字体。
+    # 中文系统缺少部分字形时由系统自动 fallback。
+    font.lfFaceName = (
+        "Microsoft YaHei UI"
+    )
 
-    handle = gdi32.CreateFontIndirectW(
-        ctypes.byref(lf)
+    handle = (
+        gdi32.CreateFontIndirectW(
+            ctypes.byref(font)
+        )
     )
 
     if handle:
@@ -1544,10 +1677,10 @@ def create_control(
     style,
     x,
     y,
-    w,
-    h,
+    width,
+    height,
     control_id=0,
-    size=10,
+    size=9,
     weight=FW_NORMAL,
 ):
 
@@ -1560,8 +1693,8 @@ def create_control(
         | style,
         x,
         y,
-        w,
-        h,
+        width,
+        height,
         main_hwnd,
         ctypes.c_void_p(
             control_id
@@ -1585,6 +1718,39 @@ def create_control(
     )
 
     return hwnd
+
+
+def draw_card(
+    hdc,
+    x,
+    y,
+    width,
+    height,
+):
+
+    brush = gdi32.CreateSolidBrush(
+        0x00FFFFFF
+    )
+
+    if not brush:
+        return
+
+    rect = RECT(
+        x,
+        y,
+        x + width,
+        y + height,
+    )
+
+    user32.FillRect(
+        hdc,
+        ctypes.byref(rect),
+        brush,
+    )
+
+    gdi32.DeleteObject(
+        brush
+    )
 
 
 def paint_window(hwnd):
@@ -1614,11 +1780,33 @@ def paint_window(hwnd):
             background_brush,
         )
 
+    # 状态卡片
+    draw_card(
+        hdc,
+        18,
+        82,
+        364,
+        150,
+    )
+
+    # 设置卡片
+    draw_card(
+        hdc,
+        18,
+        245,
+        364,
+        215,
+    )
+
     user32.EndPaint(
         hwnd,
         ctypes.byref(paint),
     )
 
+
+# ============================================================
+# UI refresh
+# ============================================================
 
 def update_ui():
 
@@ -1651,7 +1839,7 @@ def update_ui():
 
         set_text(
             detail_hwnd,
-            "网络流量已被临时阻断",
+            "Windows 防火墙正在阻断系统网络流量",
         )
 
     else:
@@ -1666,7 +1854,14 @@ def update_ui():
             "网络连接正常，可正常访问互联网",
         )
 
-    if not capture_mode:
+    if capture_mode:
+
+        set_text(
+            hotkey_hwnd,
+            "请按下新的快捷键",
+        )
+
+    else:
 
         set_text(
             hotkey_hwnd,
@@ -1681,8 +1876,13 @@ def update_ui():
     )
 
     if tray_added:
-
         update_tray_tip()
+
+    user32.InvalidateRect(
+        main_hwnd,
+        None,
+        True,
+    )
 
 
 # ============================================================
@@ -1735,14 +1935,6 @@ def add_tray():
             ctypes.byref(data),
         )
     )
-
-
-def recreate_tray():
-
-    global tray_added
-
-    tray_added = False
-    add_tray()
 
 
 def update_tray_tip():
@@ -1886,7 +2078,10 @@ def request_exit():
 
     capture_mode = False
 
-    cleanup_rules()
+    stop_keyboard_thread()
+
+    # 无论当前 UI 状态如何，都尝试清理自己的规则。
+    cleanup_firewall_rules()
 
     user32.DestroyWindow(
         main_hwnd
@@ -1906,12 +2101,6 @@ def wnd_proc(
 
     global adapter_text_pending
     global pending_error
-    global capture_mode
-
-    if msg == TASKBAR_CREATED:
-
-        recreate_tray()
-        return 0
 
     if msg == WM_PAINT:
 
@@ -1927,13 +2116,12 @@ def wnd_proc(
 
         gdi32.SetBkMode(
             hdc,
-            TRANSPARENT,
+            1,
         )
 
-        # 统一使用 Windows 原生浅灰背景。
         gdi32.SetTextColor(
             hdc,
-            COLOR_TEXT,
+            0x001D1D1F,
         )
 
         return background_brush
@@ -1964,7 +2152,7 @@ def wnd_proc(
         if error:
 
             show_error(
-                "网络切换失败",
+                "操作失败",
                 error,
             )
 
@@ -1978,7 +2166,7 @@ def wnd_proc(
 
         return 0
 
-    if msg == WM_CAPTURE_KEY:
+    if msg == WM_CAPTURE_RESULT:
 
         finish_capture(
             int(wparam),
@@ -2012,14 +2200,6 @@ def wnd_proc(
 
             return 0
 
-    if msg == WM_HOTKEY:
-
-        if not capture_mode:
-
-            toggle_async()
-
-        return 0
-
     if msg == WM_TRAY:
 
         if lparam in (
@@ -2039,7 +2219,7 @@ def wnd_proc(
 
     if msg == WM_CLOSE:
 
-        # 关闭主窗口 = 隐藏到系统托盘。
+        # 关闭窗口 = 隐藏到托盘。
         user32.ShowWindow(
             hwnd,
             SW_HIDE,
@@ -2049,14 +2229,11 @@ def wnd_proc(
 
     if msg == WM_DESTROY:
 
-        user32.UnregisterHotKey(
-            hwnd,
-            HOTKEY_ID,
-        )
+        stop_keyboard_thread()
 
         remove_tray()
 
-        cleanup_rules()
+        cleanup_firewall_rules()
 
         user32.PostQuitMessage(
             0
@@ -2094,8 +2271,6 @@ def register_window_class():
 
     wc.style = 0
     wc.lpfnWndProc = proc
-    wc.cbClsExtra = 0
-    wc.cbWndExtra = 0
     wc.hInstance = instance
 
     wc.hIcon = user32.LoadIconW(
@@ -2113,7 +2288,6 @@ def register_window_class():
     )
 
     wc.hbrBackground = None
-    wc.lpszMenuName = None
     wc.lpszClassName = CLASS_NAME
     wc.hIconSm = wc.hIcon
 
@@ -2126,12 +2300,11 @@ def register_window_class():
         error = ctypes.get_last_error()
 
         if error != 1410:
-
             raise ctypes.WinError(
                 error
             )
 
-    # 必须保持 Python 回调引用。
+    # 保证 Python callback 一直存活。
     register_window_class.proc = proc
 
 
@@ -2164,8 +2337,8 @@ def create_main_window():
     rect = RECT(
         0,
         0,
-        400,
-        600,
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
     )
 
     user32.AdjustWindowRectEx(
@@ -2176,11 +2349,13 @@ def create_main_window():
     )
 
     outer_width = (
-        rect.right - rect.left
+        rect.right
+        - rect.left
     )
 
     outer_height = (
-        rect.bottom - rect.top
+        rect.bottom
+        - rect.top
     )
 
     screen_width = user32.GetSystemMetrics(
@@ -2193,12 +2368,18 @@ def create_main_window():
 
     x = max(
         0,
-        (screen_width - outer_width) // 2,
+        (
+            screen_width
+            - outer_width
+        ) // 2,
     )
 
     y = max(
         0,
-        (screen_height - outer_height) // 2,
+        (
+            screen_height
+            - outer_height
+        ) // 2,
     )
 
     main_hwnd = user32.CreateWindowExW(
@@ -2224,7 +2405,7 @@ def create_main_window():
 
     background_brush = (
         gdi32.CreateSolidBrush(
-            COLOR_BG
+            0x00F7F7F7
         )
     )
 
@@ -2237,7 +2418,7 @@ def create_main_window():
         APP_NAME,
         SS_LEFTNOWORDWRAP,
         24,
-        22,
+        20,
         340,
         30,
         size=17,
@@ -2249,22 +2430,22 @@ def create_main_window():
         "快速切换系统网络状态",
         SS_LEFTNOWORDWRAP,
         24,
-        53,
+        51,
         340,
         20,
         size=9,
     )
 
     # --------------------------------------------------------
-    # Status
+    # Status card
     # --------------------------------------------------------
 
     create_control(
         "STATIC",
         "当前状态",
         SS_LEFTNOWORDWRAP,
-        24,
-        94,
+        35,
+        103,
         120,
         20,
         size=9,
@@ -2275,10 +2456,10 @@ def create_main_window():
         "STATIC",
         "网络正常",
         SS_LEFTNOWORDWRAP,
-        24,
-        119,
+        35,
+        127,
         220,
-        31,
+        32,
         size=18,
         weight=FW_SEMIBOLD,
     )
@@ -2287,10 +2468,10 @@ def create_main_window():
         "STATIC",
         "网络连接正常，可正常访问互联网",
         SS_LEFT,
-        24,
-        153,
-        245,
-        36,
+        35,
+        163,
+        240,
+        35,
         size=8,
     )
 
@@ -2315,8 +2496,8 @@ def create_main_window():
         "STATIC",
         "设置",
         SS_LEFTNOWORDWRAP,
-        24,
-        218,
+        35,
+        263,
         200,
         22,
         size=9,
@@ -2327,8 +2508,8 @@ def create_main_window():
         "STATIC",
         "断网快捷键",
         SS_LEFTNOWORDWRAP,
-        24,
-        252,
+        35,
+        295,
         80,
         22,
         size=9,
@@ -2339,8 +2520,8 @@ def create_main_window():
         hotkey_display(),
         SS_LEFTNOWORDWRAP,
         125,
-        252,
-        145,
+        295,
+        165,
         22,
         size=10,
         weight=FW_SEMIBOLD,
@@ -2351,7 +2532,7 @@ def create_main_window():
         "修改",
         WS_TABSTOP,
         300,
-        246,
+        289,
         64,
         30,
         ID_BTN_HOTKEY,
@@ -2360,11 +2541,11 @@ def create_main_window():
 
     create_control(
         "STATIC",
-        "点击修改后直接按下新的快捷键，不会弹出额外设置窗口。",
+        "点击“修改”后直接按下新的按键，不会弹出额外窗口。",
         SS_LEFT,
-        24,
-        282,
-        340,
+        35,
+        325,
+        325,
         35,
         size=7,
     )
@@ -2377,8 +2558,8 @@ def create_main_window():
         "STATIC",
         "物理网络适配器",
         SS_LEFTNOWORDWRAP,
-        24,
-        330,
+        35,
+        360,
         200,
         22,
         size=9,
@@ -2389,10 +2570,10 @@ def create_main_window():
         "STATIC",
         "读取中…",
         SS_LEFT,
-        24,
-        358,
-        330,
-        70,
+        35,
+        387,
+        325,
+        68,
         size=9,
     )
 
@@ -2404,8 +2585,8 @@ def create_main_window():
         "STATIC",
         "管理员权限",
         SS_LEFTNOWORDWRAP,
-        24,
-        446,
+        35,
+        468,
         80,
         22,
         size=9,
@@ -2416,8 +2597,8 @@ def create_main_window():
         "检测中…",
         SS_LEFTNOWORDWRAP,
         125,
-        446,
-        210,
+        468,
+        180,
         22,
         size=9,
         weight=FW_SEMIBOLD,
@@ -2428,26 +2609,22 @@ def create_main_window():
         "刷新",
         WS_TABSTOP,
         300,
-        477,
+        505,
         64,
         30,
         ID_BTN_REFRESH,
         size=9,
     )
 
-    # --------------------------------------------------------
-    # Footer
-    # --------------------------------------------------------
-
     create_control(
         "STATIC",
-        "Windows 防火墙临时阻断网络流量\r\n"
-        "不关闭 Wi-Fi / Ethernet，不修改 IP、DNS 或路由",
+        "Windows 防火墙临时阻断网络流量。\r\n"
+        "不关闭 Wi-Fi / Ethernet，不修改 IP、DNS 或路由。",
         SS_LEFT,
-        24,
-        520,
-        340,
-        48,
+        35,
+        515,
+        260,
+        55,
         size=7,
     )
 
@@ -2497,17 +2674,9 @@ def main():
 
         return
 
-    if not is_admin():
-
-        user32.MessageBoxW(
-            None,
-            "程序需要管理员权限才能控制 Windows 防火墙。\n"
-            "请使用管理员身份运行。",
-            APP_NAME,
-            MB_OK | MB_ICONERROR,
-        )
-
-        return
+    # --------------------------------------------------------
+    # Single instance
+    # --------------------------------------------------------
 
     mutex_handle = kernel32.CreateMutexW(
         None,
@@ -2521,10 +2690,7 @@ def main():
             ctypes.get_last_error()
         )
 
-    if (
-        kernel32.GetLastError()
-        == 183
-    ):
+    if kernel32.GetLastError() == 183:
 
         user32.MessageBoxW(
             None,
@@ -2539,16 +2705,16 @@ def main():
 
         return
 
-    load_config()
+    # --------------------------------------------------------
+    # Admin
+    # --------------------------------------------------------
 
-    # 如果程序上一次异常退出，
-    # 启动时只清理自己的两条规则。
-    if not cleanup_rules():
+    if not is_admin():
 
         user32.MessageBoxW(
             None,
-            "无法确认本程序的 Windows 防火墙规则状态。\n"
-            "为避免异常断网，程序将退出。",
+            "程序需要管理员权限才能控制 Windows 防火墙。\n"
+            "请使用管理员身份运行。",
             APP_NAME,
             MB_OK | MB_ICONERROR,
         )
@@ -2559,57 +2725,59 @@ def main():
 
         return
 
+    # --------------------------------------------------------
+    # Config
+    # --------------------------------------------------------
+
+    load_config()
+
+    # --------------------------------------------------------
+    # 启动时只“尽量”清理自己的旧规则。
+    # 失败不会阻止程序启动。
+    # --------------------------------------------------------
+
+    cleanup_firewall_rules()
+
+    # --------------------------------------------------------
+    # Window
+    # --------------------------------------------------------
+
+    register_window_class()
+    create_main_window()
+
+    add_tray()
+
+    user32.ShowWindow(
+        main_hwnd,
+        SW_SHOWNORMAL,
+    )
+
+    user32.UpdateWindow(
+        main_hwnd
+    )
+
+    update_ui()
+    refresh_adapters_async()
+
+    # --------------------------------------------------------
+    # 启动键盘监听线程
+    # --------------------------------------------------------
+
+    start_keyboard_thread()
+
+    # --------------------------------------------------------
+    # Win32 message loop
+    # --------------------------------------------------------
+
     try:
-
-        register_window_class()
-        create_main_window()
-
-        if not register_hotkey():
-
-            old_vk = hotkey_vk
-            old_mod = hotkey_mod
-
-            hotkey_vk = DEFAULT_VK
-            hotkey_mod = DEFAULT_MOD
-
-            if not register_hotkey():
-
-                hotkey_vk = old_vk
-                hotkey_mod = old_mod
-
-                show_error(
-                    "快捷键注册失败",
-                    "Home 也无法注册，请检查是否有其他程序占用快捷键。",
-                )
-
-            else:
-
-                save_config()
-
-        add_tray()
-
-        user32.ShowWindow(
-            main_hwnd,
-            SW_SHOWNORMAL,
-        )
-
-        user32.UpdateWindow(
-            main_hwnd
-        )
-
-        update_ui()
-        refresh_adapters_async()
 
         message_loop()
 
     finally:
 
-        user32.UnregisterHotKey(
-            main_hwnd,
-            HOTKEY_ID,
-        )
+        stop_keyboard_thread()
 
-        cleanup_rules()
+        cleanup_firewall_rules()
         remove_tray()
 
         if background_brush:
