@@ -7,7 +7,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 
 
@@ -287,593 +286,6 @@ gdi32 = ctypes.WinDLL(
     "gdi32",
     use_last_error=True,
 )
-
-
-# ============================================================
-# Native Windows Filtering Platform (WFP)
-# ============================================================
-# Runtime network blocking is performed directly through Fwpuclnt.dll.
-# No PowerShell/netsh/Firewall COM is used by the network hot path.
-#
-# The WFP manager session is dynamic:
-#   - filters/sub-layer created by this session are removed automatically
-#     when the session closes, including process termination.
-#
-# Four IP-packet filters are used:
-#   inbound IPv4, outbound IPv4, inbound IPv6, outbound IPv6.
-# They are applied inside one WFP transaction so the block becomes
-# visible atomically rather than exposing a partial 4-filter state.
-
-fwpuclnt = ctypes.WinDLL(
-    "fwpuclnt.dll",
-    use_last_error=True,
-)
-
-# RPC authentication constant used by FwpmEngineOpen0.
-RPC_C_AUTHN_WINNT = 10
-
-# WFP constants.
-FWPM_SESSION_FLAG_DYNAMIC = 0x00000001
-FWP_EMPTY = 0
-FWP_ACTION_BLOCK = 0x00000001
-
-# Built-in management layer GUIDs.
-# Values correspond to fwpmu.h / Microsoft's management layer identifiers.
-WFP_LAYER_INBOUND_IPPACKET_V4 = "c86fd1bf-21cd-497e-a0bb-17425c885c58"
-WFP_LAYER_INBOUND_IPPACKET_V6 = "f52032cb-991c-46e7-971d-2601459a91ca"
-WFP_LAYER_OUTBOUND_IPPACKET_V4 = "1e5c9fae-8a84-4135-a331-950b54229ecd"
-WFP_LAYER_OUTBOUND_IPPACKET_V6 = "a3b3ab6b-3564-488c-9117-f34e82142763"
-
-
-class GUID(ctypes.Structure):
-    _fields_ = [
-        ("Data1", wintypes.DWORD),
-        ("Data2", wintypes.WORD),
-        ("Data3", wintypes.WORD),
-        ("Data4", wintypes.BYTE * 8),
-    ]
-
-
-def guid_from_string(value):
-    u = uuid.UUID(str(value))
-    raw = u.bytes_le
-    g = GUID()
-    ctypes.memmove(ctypes.byref(g), raw, 16)
-    return g
-
-
-class FWPM_DISPLAY_DATA0(ctypes.Structure):
-    _fields_ = [
-        ("name", wintypes.LPWSTR),
-        ("description", wintypes.LPWSTR),
-    ]
-
-
-class FWP_BYTE_BLOB(ctypes.Structure):
-    _fields_ = [
-        ("size", wintypes.DWORD),
-        ("data", ctypes.POINTER(wintypes.BYTE)),
-    ]
-
-
-class FWP_VALUE0_UNION(ctypes.Union):
-    _fields_ = [
-        ("uint8", wintypes.BYTE),
-        ("uint16", wintypes.WORD),
-        ("uint32", wintypes.DWORD),
-        ("uint64", ctypes.POINTER(ctypes.c_uint64)),
-        ("int8", ctypes.c_int8),
-        ("int16", ctypes.c_int16),
-        ("int32", ctypes.c_int32),
-        ("int64", ctypes.POINTER(ctypes.c_int64)),
-        ("float32", ctypes.c_float),
-        ("double64", ctypes.POINTER(ctypes.c_double)),
-        ("byteArray16", ctypes.c_void_p),
-        ("byteBlob", ctypes.POINTER(FWP_BYTE_BLOB)),
-        ("sid", ctypes.c_void_p),
-        ("sd", ctypes.POINTER(FWP_BYTE_BLOB)),
-        ("tokenInformation", ctypes.c_void_p),
-        ("tokenAccessInformation", ctypes.POINTER(FWP_BYTE_BLOB)),
-        ("unicodeString", wintypes.LPWSTR),
-        ("byteArray6", ctypes.c_void_p),
-    ]
-
-
-class FWP_VALUE0(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("value", FWP_VALUE0_UNION),
-    ]
-
-
-class FWPM_SUBLAYER0(ctypes.Structure):
-    _fields_ = [
-        ("subLayerKey", GUID),
-        ("displayData", FWPM_DISPLAY_DATA0),
-        ("flags", wintypes.DWORD),
-        ("providerKey", ctypes.POINTER(GUID)),
-        ("providerData", FWP_BYTE_BLOB),
-        ("weight", wintypes.WORD),
-    ]
-
-
-class FWPM_SESSION0(ctypes.Structure):
-    _fields_ = [
-        ("sessionKey", GUID),
-        ("displayData", FWPM_DISPLAY_DATA0),
-        ("flags", wintypes.DWORD),
-        ("txnWaitTimeoutInMSec", wintypes.DWORD),
-        ("processId", wintypes.DWORD),
-        ("sid", ctypes.c_void_p),
-        ("username", wintypes.LPWSTR),
-        ("kernelMode", wintypes.BOOL),
-    ]
-
-
-class FWPM_ACTION0_UNION(ctypes.Union):
-    _fields_ = [
-        ("filterType", GUID),
-        ("calloutKey", GUID),
-    ]
-
-
-class FWPM_ACTION0(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("value", FWPM_ACTION0_UNION),
-    ]
-
-
-class FWPM_FILTER_CONTEXT_UNION(ctypes.Union):
-    _fields_ = [
-        ("rawContext", ctypes.c_uint64),
-        ("providerContextKey", GUID),
-    ]
-
-
-class FWPM_FILTER0(ctypes.Structure):
-    _fields_ = [
-        ("filterKey", GUID),
-        ("displayData", FWPM_DISPLAY_DATA0),
-        ("flags", wintypes.DWORD),
-        ("providerKey", ctypes.POINTER(GUID)),
-        ("providerData", FWP_BYTE_BLOB),
-        ("layerKey", GUID),
-        ("subLayerKey", GUID),
-        ("weight", FWP_VALUE0),
-        ("numFilterConditions", wintypes.DWORD),
-        ("filterCondition", ctypes.c_void_p),
-        ("action", FWPM_ACTION0),
-        ("context", FWPM_FILTER_CONTEXT_UNION),
-        ("reserved", ctypes.POINTER(GUID)),
-        ("filterId", ctypes.c_uint64),
-        ("effectiveWeight", FWP_VALUE0),
-    ]
-
-
-# Function declarations from fwpuclnt.dll.
-fwpuclnt.FwpmEngineOpen0.argtypes = [
-    wintypes.LPCWSTR,
-    wintypes.DWORD,
-    ctypes.c_void_p,
-    ctypes.POINTER(FWPM_SESSION0),
-    ctypes.POINTER(HANDLE),
-]
-fwpuclnt.FwpmEngineOpen0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmEngineClose0.argtypes = [HANDLE]
-fwpuclnt.FwpmEngineClose0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmSubLayerAdd0.argtypes = [
-    HANDLE,
-    ctypes.POINTER(FWPM_SUBLAYER0),
-    ctypes.c_void_p,
-]
-fwpuclnt.FwpmSubLayerAdd0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmSubLayerDeleteByKey0.argtypes = [
-    HANDLE,
-    ctypes.POINTER(GUID),
-]
-fwpuclnt.FwpmSubLayerDeleteByKey0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmFilterAdd0.argtypes = [
-    HANDLE,
-    ctypes.POINTER(FWPM_FILTER0),
-    ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_uint64),
-]
-fwpuclnt.FwpmFilterAdd0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmFilterDeleteById0.argtypes = [
-    HANDLE,
-    ctypes.c_uint64,
-]
-fwpuclnt.FwpmFilterDeleteById0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmTransactionBegin0.argtypes = [
-    HANDLE,
-    wintypes.DWORD,
-]
-fwpuclnt.FwpmTransactionBegin0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmTransactionCommit0.argtypes = [
-    HANDLE,
-]
-fwpuclnt.FwpmTransactionCommit0.restype = wintypes.DWORD
-
-fwpuclnt.FwpmTransactionAbort0.argtypes = [
-    HANDLE,
-]
-fwpuclnt.FwpmTransactionAbort0.restype = wintypes.DWORD
-
-
-def _wfp_raise(operation, code):
-    if code == 0:
-        return
-    raise RuntimeError(
-        f"{operation} 失败：WFP 错误码 0x{int(code):08X}"
-    )
-
-
-def _wfp_empty_value():
-    value = FWP_VALUE0()
-    value.type = FWP_EMPTY
-    value.value.uint64 = None
-    return value
-
-
-class WfpNetworkController:
-    """
-    Persistent WFP manager.
-
-    The worker thread owns the WFP engine handle and is the only thread
-    that mutates filters. This keeps the engine hot and removes process
-    creation / subprocess / COM overhead from the toggle path.
-    """
-
-    def __init__(self):
-        self._event = threading.Event()
-        self._stop = threading.Event()
-        self._ready = threading.Event()
-        self._lock = threading.Lock()
-
-        self._requested = None
-        self._error = None
-        self._engine = None
-        self._sublayer_key = None
-        self._sublayer_added = False
-        self._filter_ids = []
-
-        self._thread = threading.Thread(
-            target=self._run,
-            name="GuaguaWfpWorker",
-            daemon=True,
-        )
-        self._thread.start()
-
-        if not self._ready.wait(8.0):
-            raise RuntimeError("WFP 工作线程初始化超时。")
-
-        if self._error:
-            raise RuntimeError(self._error)
-
-    @property
-    def ready(self):
-        return bool(self._engine and self._sublayer_added)
-
-    def _open_engine(self):
-        session_key = GUID()
-        display_name = ctypes.create_unicode_buffer(
-            "呱呱一键断网 WFP Session"
-        )
-        display_desc = ctypes.create_unicode_buffer(
-            "临时系统网络阻断会话"
-        )
-
-        session = FWPM_SESSION0()
-        session.sessionKey = session_key
-        session.displayData = FWPM_DISPLAY_DATA0(
-            ctypes.cast(display_name, wintypes.LPWSTR),
-            ctypes.cast(display_desc, wintypes.LPWSTR),
-        )
-        session.flags = FWPM_SESSION_FLAG_DYNAMIC
-        session.txnWaitTimeoutInMSec = 2000
-        session.processId = 0
-        session.sid = None
-        session.username = None
-        session.kernelMode = False
-
-        engine = HANDLE()
-        code = fwpuclnt.FwpmEngineOpen0(
-            None,
-            RPC_C_AUTHN_WINNT,
-            None,
-            ctypes.byref(session),
-            ctypes.byref(engine),
-        )
-        _wfp_raise("FwpmEngineOpen0", code)
-        self._engine = engine
-
-        self._sublayer_key = guid_from_string(str(uuid.uuid4()))
-
-        sub_name = ctypes.create_unicode_buffer(
-            "呱呱一键断网"
-        )
-        sub_desc = ctypes.create_unicode_buffer(
-            "临时全局网络阻断子层"
-        )
-
-        sublayer = FWPM_SUBLAYER0()
-        sublayer.subLayerKey = self._sublayer_key
-        sublayer.displayData = FWPM_DISPLAY_DATA0(
-            ctypes.cast(sub_name, wintypes.LPWSTR),
-            ctypes.cast(sub_desc, wintypes.LPWSTR),
-        )
-        sublayer.flags = 0
-        sublayer.providerKey = None
-        sublayer.providerData = FWP_BYTE_BLOB(0, None)
-        sublayer.weight = 0xFFFF
-
-        code = fwpuclnt.FwpmSubLayerAdd0(
-            self._engine,
-            ctypes.byref(sublayer),
-            None,
-        )
-
-        # ERROR_ALREADY_EXISTS is not expected because the key is random.
-        _wfp_raise("FwpmSubLayerAdd0", code)
-        self._sublayer_added = True
-
-    def _make_filter(self, layer_guid, filter_name):
-        display_name = ctypes.create_unicode_buffer(filter_name)
-        display_desc = ctypes.create_unicode_buffer(
-            "按需启用时阻断系统所有 IPv4/IPv6 网络包"
-        )
-
-        filt = FWPM_FILTER0()
-        filt.filterKey = GUID()  # zero => BFE generates a runtime ID
-        filt.displayData = FWPM_DISPLAY_DATA0(
-            ctypes.cast(display_name, wintypes.LPWSTR),
-            ctypes.cast(display_desc, wintypes.LPWSTR),
-        )
-        filt.flags = 0
-        filt.providerKey = None
-        filt.providerData = FWP_BYTE_BLOB(0, None)
-        filt.layerKey = guid_from_string(layer_guid)
-        filt.subLayerKey = self._sublayer_key
-        filt.weight = _wfp_empty_value()
-        filt.numFilterConditions = 0
-        filt.filterCondition = None
-
-        action = FWPM_ACTION0()
-        action.type = FWP_ACTION_BLOCK
-        action.value.filterType = GUID()
-        filt.action = action
-
-        filt.context.rawContext = 0
-        filt.reserved = None
-        filt.filterId = 0
-        filt.effectiveWeight = _wfp_empty_value()
-
-        # Keep ctypes string buffers alive for the duration of the call.
-        return filt, display_name, display_desc
-
-    def _add_block_filters(self):
-        if self._filter_ids:
-            return
-
-        layers = (
-            (
-                WFP_LAYER_INBOUND_IPPACKET_V4,
-                "呱呱 WFP 阻断 IPv4 入站",
-            ),
-            (
-                WFP_LAYER_OUTBOUND_IPPACKET_V4,
-                "呱呱 WFP 阻断 IPv4 出站",
-            ),
-            (
-                WFP_LAYER_INBOUND_IPPACKET_V6,
-                "呱呱 WFP 阻断 IPv6 入站",
-            ),
-            (
-                WFP_LAYER_OUTBOUND_IPPACKET_V6,
-                "呱呱 WFP 阻断 IPv6 出站",
-            ),
-        )
-
-        code = fwpuclnt.FwpmTransactionBegin0(
-            self._engine,
-            0,
-        )
-        _wfp_raise("FwpmTransactionBegin0", code)
-
-        pending_ids = []
-
-        try:
-            for layer_guid, name in layers:
-                filt, name_buf, desc_buf = self._make_filter(
-                    layer_guid,
-                    name,
-                )
-                filter_id = ctypes.c_uint64(0)
-
-                code = fwpuclnt.FwpmFilterAdd0(
-                    self._engine,
-                    ctypes.byref(filt),
-                    None,
-                    ctypes.byref(filter_id),
-                )
-                _wfp_raise("FwpmFilterAdd0", code)
-
-                pending_ids.append(int(filter_id.value))
-
-            code = fwpuclnt.FwpmTransactionCommit0(
-                self._engine,
-            )
-            _wfp_raise("FwpmTransactionCommit0", code)
-
-            self._filter_ids = pending_ids
-
-        except Exception:
-            try:
-                fwpuclnt.FwpmTransactionAbort0(
-                    self._engine
-                )
-            except Exception:
-                pass
-            raise
-
-    def _remove_block_filters(self):
-        if not self._filter_ids:
-            return
-
-        code = fwpuclnt.FwpmTransactionBegin0(
-            self._engine,
-            0,
-        )
-        _wfp_raise("FwpmTransactionBegin0", code)
-
-        ids = list(self._filter_ids)
-
-        try:
-            for filter_id in ids:
-                code = fwpuclnt.FwpmFilterDeleteById0(
-                    self._engine,
-                    ctypes.c_uint64(filter_id),
-                )
-
-                # Dynamic sessions can only delete objects belonging to
-                # the same session. All our IDs are created here.
-                _wfp_raise(
-                    f"FwpmFilterDeleteById0({filter_id})",
-                    code,
-                )
-
-            code = fwpuclnt.FwpmTransactionCommit0(
-                self._engine
-            )
-            _wfp_raise("FwpmTransactionCommit0", code)
-
-            self._filter_ids = []
-
-        except Exception:
-            try:
-                fwpuclnt.FwpmTransactionAbort0(
-                    self._engine
-                )
-            except Exception:
-                pass
-            raise
-
-    def _shutdown_wfp(self):
-        try:
-            if self._engine:
-                # If filters remain for any reason, removing them explicitly
-                # makes normal shutdown deterministic.
-                if self._filter_ids:
-                    try:
-                        self._remove_block_filters()
-                    except Exception:
-                        pass
-
-                # Dynamic session guarantees cleanup even if explicit removal
-                # could not finish.
-                fwpuclnt.FwpmEngineClose0(
-                    self._engine
-                )
-
-        finally:
-            self._engine = None
-            self._sublayer_added = False
-            self._filter_ids = []
-
-    def _run(self):
-        try:
-            self._open_engine()
-        except Exception as error:
-            self._error = str(error)
-            self._ready.set()
-            return
-
-        self._ready.set()
-
-        try:
-            while not self._stop.is_set():
-                self._event.wait()
-                self._event.clear()
-
-                if self._stop.is_set():
-                    break
-
-                with self._lock:
-                    requested = self._requested
-                    self._requested = None
-
-                if requested is None:
-                    continue
-
-                try:
-                    if requested:
-                        self._add_block_filters()
-                    else:
-                        self._remove_block_filters()
-
-                    with state_lock:
-                        global offline
-                        offline = bool(requested)
-
-                except Exception as error:
-                    with error_lock:
-                        global pending_error
-                        pending_error = str(error)
-
-                    # If adding failed, guarantee the application does not
-                    # falsely report an offline state.
-                    if main_hwnd:
-                        user32.PostMessageW(
-                            main_hwnd,
-                            WM_ERROR,
-                            0,
-                            0,
-                        )
-
-                finally:
-                    with state_lock:
-                        global busy
-                        busy = False
-
-                    if main_hwnd:
-                        user32.PostMessageW(
-                            main_hwnd,
-                            WM_UI_REFRESH,
-                            0,
-                            0,
-                        )
-
-        finally:
-            self._shutdown_wfp()
-
-    def request(self, enabled):
-        with state_lock:
-            if busy or shutdown_requested:
-                return False
-            busy = True
-
-        with self._lock:
-            self._requested = bool(enabled)
-
-        self._event.set()
-        return True
-
-    def stop(self):
-        self._stop.set()
-        self._event.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=3.0)
-
-
-wfp_controller = None
 
 
 # ============================================================
@@ -1246,92 +658,503 @@ def is_admin():
 
 
 # ============================================================
-# WFP network control
+# WFP native network blocking
+# ============================================================
+# 说明：
+#   GUI、快捷键、托盘、配置、线程结构全部保持原程序不变。
+#   这里只替换“网络阻断”技术路径：
+#
+#       原来：PowerShell -> Set-NetFirewallRule
+#       现在：Python ctypes -> fwpuclnt.dll -> WFP
+#
+# WFP 会话在程序启动时打开；子层在启动时创建。
+# 真正断网时只做：
+#       Add 4 terminating BLOCK filters（IPv4/IPv6 入站/出站）
+# 恢复时只做：
+#       Delete 这 4 个 filter
+#
+# 使用动态 WFP session，因此程序退出后，session 中创建的对象会由 BFE 自动清理。
 # ============================================================
 
-firewall_ready = False
+# WFP constants
+RPC_C_AUTHN_WINNT = 10
+FWPM_SESSION_FLAG_DYNAMIC = 0x00000001
+FWPM_SUBLAYER_FLAG_PERSISTENT = 0x00000001
+FWP_EMPTY = 0
+FWP_UINT64 = 4
+FWP_ACTION_BLOCK = 0x00000001
+
+# WFP layer GUIDs
+FWPM_LAYER_INBOUND_IPPACKET_V4 = "c86fd1bf-21cd-497e-a0bb-17425c885c58"
+FWPM_LAYER_INBOUND_IPPACKET_V6 = "f52032cb-991c-46e7-971d-2601459a91ca"
+FWPM_LAYER_OUTBOUND_IPPACKET_V4 = "1e5c9fae-8a84-4135-a331-950b54229ecd"
+FWPM_LAYER_OUTBOUND_IPPACKET_V6 = "a3b3ab6b-3564-488c-9117-f34e82142763"
+
+# 自己的 WFP sublayer GUID。只在本程序动态 session 中使用。
+WFP_SUBLAYER_GUID = "8b0d6b6c-8e0d-4f2b-a8e0-7e2f5b4f7c31"
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", wintypes.BYTE * 8),
+    ]
+
+
+class FWPM_DISPLAY_DATA0(ctypes.Structure):
+    _fields_ = [
+        ("name", wintypes.LPCWSTR),
+        ("description", wintypes.LPCWSTR),
+    ]
+
+
+class FWP_BYTE_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("size", wintypes.UINT),
+        ("data", ctypes.POINTER(wintypes.BYTE)),
+    ]
+
+
+class FWP_VALUE0_UNION(ctypes.Union):
+    _fields_ = [
+        ("uint8", wintypes.BYTE),
+        ("uint16", wintypes.WORD),
+        ("uint32", wintypes.DWORD),
+        ("uint64", ctypes.POINTER(ctypes.c_uint64)),
+        ("int8", ctypes.c_byte),
+        ("int16", ctypes.c_short),
+        ("int32", ctypes.c_int32),
+        ("int64", ctypes.POINTER(ctypes.c_int64)),
+        ("float32", ctypes.c_float),
+        ("double64", ctypes.POINTER(ctypes.c_double)),
+        ("byteArray16", ctypes.c_void_p),
+        ("byteBlob", ctypes.POINTER(FWP_BYTE_BLOB)),
+        ("sid", ctypes.c_void_p),
+        ("sd", ctypes.POINTER(FWP_BYTE_BLOB)),
+        ("tokenInformation", ctypes.c_void_p),
+        ("tokenAccessInformation", ctypes.POINTER(FWP_BYTE_BLOB)),
+        ("unicodeString", wintypes.LPWSTR),
+        ("byteArray6", ctypes.c_void_p),
+    ]
+
+
+class FWP_VALUE0(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.UINT),
+        ("value", FWP_VALUE0_UNION),
+    ]
+
+
+class FWPM_ACTION0_UNION(ctypes.Union):
+    _fields_ = [
+        ("filterType", GUID),
+        ("calloutKey", GUID),
+    ]
+
+
+class FWPM_ACTION0(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.UINT),
+        ("action", FWPM_ACTION0_UNION),
+    ]
+
+
+class FWPM_SUBLAYER0(ctypes.Structure):
+    _fields_ = [
+        ("subLayerKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", wintypes.UINT),
+        ("providerKey", ctypes.POINTER(GUID)),
+        ("providerData", FWP_BYTE_BLOB),
+        ("weight", wintypes.WORD),
+    ]
+
+
+class FWPM_FILTER_CONTEXT_UNION(ctypes.Union):
+    _fields_ = [
+        ("rawContext", ctypes.c_uint64),
+        ("providerContextKey", GUID),
+    ]
+
+
+class FWPM_FILTER0(ctypes.Structure):
+    _fields_ = [
+        ("filterKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", wintypes.UINT),
+        ("providerKey", ctypes.POINTER(GUID)),
+        ("providerData", FWP_BYTE_BLOB),
+        ("layerKey", GUID),
+        ("subLayerKey", GUID),
+        ("weight", FWP_VALUE0),
+        ("numFilterConditions", wintypes.UINT),
+        ("filterCondition", ctypes.c_void_p),
+        ("action", FWPM_ACTION0),
+        ("context", FWPM_FILTER_CONTEXT_UNION),
+        ("reserved", ctypes.POINTER(GUID)),
+        ("filterId", ctypes.c_uint64),
+        ("effectiveWeight", FWP_VALUE0),
+    ]
+
+
+def guid_from_string(value):
+    """把标准 GUID 字符串转换成 Windows GUID 结构。"""
+    import uuid
+
+    u = uuid.UUID(value)
+    g = GUID()
+    g.Data1 = u.time_low
+    g.Data2 = u.time_mid
+    g.Data3 = u.time_hi_version
+    for i, b in enumerate(u.bytes[8:]):
+        g.Data4[i] = b
+    return g
+
+
+class FWPM_SESSION0(ctypes.Structure):
+    _fields_ = [
+        ("sessionKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", wintypes.UINT),
+        ("txnWaitTimeoutInMSec", wintypes.UINT),
+        ("processId", wintypes.DWORD),
+        ("sid", ctypes.c_void_p),
+        ("username", wintypes.LPWSTR),
+        ("kernelMode", wintypes.BOOL),
+    ]
+
+
+fwpuclnt = None
+wfp_engine = None
+wfp_ready = False
+wfp_blocked = False
+wfp_filter_ids = []
+wfp_lock = threading.RLock()
+
+
+def _load_wfp_api():
+    global fwpuclnt
+
+    if fwpuclnt is not None:
+        return fwpuclnt
+
+    fwpuclnt = ctypes.WinDLL(
+        "fwpuclnt.dll",
+        use_last_error=True,
+    )
+
+    fwpuclnt.FwpmEngineOpen0.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+        ctypes.c_void_p,
+        ctypes.POINTER(FWPM_SESSION0),
+        ctypes.POINTER(HANDLE),
+    ]
+    fwpuclnt.FwpmEngineOpen0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmEngineClose0.argtypes = [HANDLE]
+    fwpuclnt.FwpmEngineClose0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmSubLayerAdd0.argtypes = [
+        HANDLE,
+        ctypes.POINTER(FWPM_SUBLAYER0),
+        ctypes.c_void_p,
+    ]
+    fwpuclnt.FwpmSubLayerAdd0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmFilterAdd0.argtypes = [
+        HANDLE,
+        ctypes.POINTER(FWPM_FILTER0),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    fwpuclnt.FwpmFilterAdd0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmFilterDeleteById0.argtypes = [
+        HANDLE,
+        ctypes.c_uint64,
+    ]
+    fwpuclnt.FwpmFilterDeleteById0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmTransactionBegin0.argtypes = [
+        HANDLE,
+        wintypes.DWORD,
+    ]
+    fwpuclnt.FwpmTransactionBegin0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmTransactionCommit0.argtypes = [HANDLE]
+    fwpuclnt.FwpmTransactionCommit0.restype = wintypes.DWORD
+
+    fwpuclnt.FwpmTransactionAbort0.argtypes = [HANDLE]
+    fwpuclnt.FwpmTransactionAbort0.restype = wintypes.DWORD
+
+    return fwpuclnt
+
+
+def _wfp_check(code, operation):
+    if code != 0:
+        raise RuntimeError(
+            f"{operation} 失败，WFP 错误码：0x{int(code):08X}"
+        )
+
+
+def _wfp_open():
+    global wfp_engine
+
+    api = _load_wfp_api()
+
+    session = FWPM_SESSION0()
+    # FWPM_SESSION0 的实际定义在下方用 ctypes 结构补齐。
+    session.flags = FWPM_SESSION_FLAG_DYNAMIC
+    session.txnWaitTimeoutInMSec = 1000
+    session.displayData.name = "Guagua WFP Session"
+    session.displayData.description = "Guagua one-key network toggle"
+
+    engine = HANDLE()
+    code = api.FwpmEngineOpen0(
+        None,
+        RPC_C_AUTHN_WINNT,
+        None,
+        ctypes.byref(session),
+        ctypes.byref(engine),
+    )
+    _wfp_check(code, "FwpmEngineOpen0")
+    wfp_engine = engine
+
+
+def _wfp_add_sublayer():
+    api = _load_wfp_api()
+
+    sublayer = FWPM_SUBLAYER0()
+    sublayer.subLayerKey = guid_from_string(WFP_SUBLAYER_GUID)
+    sublayer.displayData.name = "Guagua Network Block"
+    sublayer.displayData.description = "Guagua temporary network block sublayer"
+    sublayer.flags = 0
+    sublayer.providerKey = None
+    sublayer.providerData.size = 0
+    sublayer.providerData.data = None
+    sublayer.weight = 0xFFFF
+
+    code = api.FwpmSubLayerAdd0(
+        wfp_engine,
+        ctypes.byref(sublayer),
+        None,
+    )
+
+    # 动态 session 中每次程序启动都只创建一次；如果极端情况下已经存在，
+    # 不把它当成致命错误。
+    if code == 0x80320009:
+        return
+
+    _wfp_check(code, "FwpmSubLayerAdd0")
+
+
+def _wfp_make_filter(layer_guid, name):
+    filter_obj = FWPM_FILTER0()
+    filter_obj.filterKey = guid_from_string(
+        __import__("uuid").uuid4().__str__()
+    )
+    filter_obj.displayData.name = name
+    filter_obj.displayData.description = "Guagua temporary terminating network block"
+    filter_obj.flags = 0
+    filter_obj.providerKey = None
+    filter_obj.providerData.size = 0
+    filter_obj.providerData.data = None
+    filter_obj.layerKey = guid_from_string(layer_guid)
+    filter_obj.subLayerKey = guid_from_string(WFP_SUBLAYER_GUID)
+
+    # 使用最高权重范围，让本程序的 BLOCK filter 尽可能优先。
+    filter_obj.weight.type = FWP_UINT64
+    weight_value = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
+    filter_obj.weight.value.uint64 = ctypes.pointer(weight_value)
+
+    # 没有 condition = 对该 layer 的所有流量生效。
+    filter_obj.numFilterConditions = 0
+    filter_obj.filterCondition = None
+
+    filter_obj.action.type = FWP_ACTION_BLOCK
+    filter_obj.action.action.filterType = guid_from_string(
+        "00000000-0000-0000-0000-000000000000"
+    )
+
+    filter_obj.context.rawContext = 0
+    filter_obj.reserved = None
+    filter_obj.filterId = 0
+    filter_obj.effectiveWeight.type = FWP_EMPTY
+
+    # 必须把 pointer 指向的 weight 保持到 FwpmFilterAdd0 调用结束。
+    return filter_obj, weight_value
+
+
+def _wfp_add_filters():
+    api = _load_wfp_api()
+    layers = [
+        (FWPM_LAYER_INBOUND_IPPACKET_V4, "Guagua Block Inbound IPv4"),
+        (FWPM_LAYER_INBOUND_IPPACKET_V6, "Guagua Block Inbound IPv6"),
+        (FWPM_LAYER_OUTBOUND_IPPACKET_V4, "Guagua Block Outbound IPv4"),
+        (FWPM_LAYER_OUTBOUND_IPPACKET_V6, "Guagua Block Outbound IPv6"),
+    ]
+
+    code = api.FwpmTransactionBegin0(wfp_engine, 0)
+    _wfp_check(code, "FwpmTransactionBegin0")
+
+    added_ids = []
+    keepalive = []
+
+    try:
+        for layer, name in layers:
+            filter_obj, weight_value = _wfp_make_filter(layer, name)
+            keepalive.append((filter_obj, weight_value))
+
+            filter_id = ctypes.c_uint64(0)
+            code = api.FwpmFilterAdd0(
+                wfp_engine,
+                ctypes.byref(filter_obj),
+                None,
+                ctypes.byref(filter_id),
+            )
+            _wfp_check(code, f"FwpmFilterAdd0({name})")
+            added_ids.append(int(filter_id.value))
+
+        code = api.FwpmTransactionCommit0(wfp_engine)
+        _wfp_check(code, "FwpmTransactionCommit0")
+
+        return added_ids
+
+    except Exception:
+        try:
+            api.FwpmTransactionAbort0(wfp_engine)
+        except Exception:
+            pass
+        raise
+
+
+def _wfp_delete_filters(filter_ids):
+    api = _load_wfp_api()
+
+    if not filter_ids:
+        return
+
+    code = api.FwpmTransactionBegin0(wfp_engine, 0)
+    _wfp_check(code, "FwpmTransactionBegin0")
+
+    try:
+        for filter_id in filter_ids:
+            code = api.FwpmFilterDeleteById0(
+                wfp_engine,
+                ctypes.c_uint64(filter_id),
+            )
+            _wfp_check(
+                code,
+                f"FwpmFilterDeleteById0({filter_id})",
+            )
+
+        code = api.FwpmTransactionCommit0(wfp_engine)
+        _wfp_check(code, "FwpmTransactionCommit0")
+
+    except Exception:
+        try:
+            api.FwpmTransactionAbort0(wfp_engine)
+        except Exception:
+            pass
+        raise
 
 
 def prepare_firewall_rules():
-    """
-    Compatibility wrapper retained for the existing startup flow.
+    """启动时建立一次 WFP 管理会话和专用 sublayer。"""
+    global wfp_ready
 
-    The old implementation created Windows Firewall rules through PowerShell.
-    The WFP controller now opens a dynamic native WFP session and creates its
-    private high-weight sub-layer. No network-blocking rules are created via
-    PowerShell.
-    """
-    global firewall_ready
-    global wfp_controller
+    with wfp_lock:
+        if wfp_ready:
+            return True
 
-    if wfp_controller is not None and wfp_controller.ready:
-        firewall_ready = True
+        _wfp_open()
+        _wfp_add_sublayer()
+        wfp_ready = True
         return True
-
-    wfp_controller = WfpNetworkController()
-    firewall_ready = True
-    return True
 
 
 def cleanup_firewall_rules():
-    """
-    Compatibility wrapper retained for existing shutdown paths.
+    """退出时恢复在线状态并关闭 WFP session。动态对象会自动清理。"""
+    global wfp_ready, wfp_blocked, wfp_filter_ids, wfp_engine
 
-    Closing the dynamic WFP session removes all WFP objects created by this
-    process automatically. If the network is currently blocked, the worker
-    first attempts to remove the filters before the engine is closed.
-    """
-    global firewall_ready
-    global wfp_controller
+    with wfp_lock:
+        try:
+            if wfp_engine and wfp_filter_ids:
+                _wfp_delete_filters(wfp_filter_ids)
+        except Exception:
+            pass
 
-    controller = wfp_controller
-    wfp_controller = None
+        wfp_filter_ids = []
+        wfp_blocked = False
 
-    if controller is None:
-        firewall_ready = False
-        return True
+        if wfp_engine:
+            try:
+                _load_wfp_api().FwpmEngineClose0(wfp_engine)
+            except Exception:
+                pass
 
-    try:
-        controller.stop()
-        firewall_ready = False
-        return True
-    except Exception:
-        firewall_ready = False
-        return False
+        wfp_engine = None
+        wfp_ready = False
 
 
 def set_firewall_state(enabled):
     """
-    Native WFP hot path.
+    网络热路径。
 
-    enabled=True:
-        Add four terminating BLOCK filters in one transaction.
+    enabled=True  -> WFP 原生 BLOCK。
+    enabled=False -> 删除 WFP BLOCK filters。
 
-    enabled=False:
-        Remove those four filters in one transaction.
+    不启动 PowerShell，不启动 netsh，不修改网卡、IP、DNS、路由。
     """
-    if not firewall_ready:
-        raise RuntimeError("WFP 尚未初始化。")
+    global wfp_blocked, wfp_filter_ids
 
-    if wfp_controller is None:
-        raise RuntimeError("WFP 控制器不可用。")
+    with wfp_lock:
+        if not wfp_ready:
+            prepare_firewall_rules()
 
-    with state_lock:
-        current = offline
+        if enabled:
+            if wfp_blocked and wfp_filter_ids:
+                return
 
-    if bool(current) == bool(enabled):
-        return
+            # 如果内部状态与实际状态不同，先清理旧 ID，避免重复 filter。
+            if wfp_filter_ids:
+                _wfp_delete_filters(wfp_filter_ids)
+                wfp_filter_ids = []
 
-    if not wfp_controller.request(bool(enabled)):
-        raise RuntimeError("WFP 切换请求未被接受。")
+            new_ids = _wfp_add_filters()
+            wfp_filter_ids = new_ids
+            wfp_blocked = True
+
+        else:
+            if not wfp_filter_ids:
+                wfp_blocked = False
+                return
+
+            old_ids = list(wfp_filter_ids)
+            _wfp_delete_filters(old_ids)
+            wfp_filter_ids = []
+            wfp_blocked = False
 
 
 def block_network():
+    global offline
+
     set_firewall_state(True)
+
+    with state_lock:
+        offline = True
 
 
 def unblock_network():
+    global offline
+
     set_firewall_state(False)
+
+    with state_lock:
+        offline = False
 
 
 # ============================================================
@@ -1339,21 +1162,30 @@ def unblock_network():
 # ============================================================
 
 def toggle_worker():
-    """
-    Compatibility wrapper: the actual work is performed by the persistent
-    WFP controller thread.
-    """
-    with state_lock:
-        target = not offline
 
-    set_firewall_state(target)
+    global busy
+    global offline
+    global pending_error
 
+    try:
 
-def toggle_async():
-    if wfp_controller is None:
+        with state_lock:
+            current = offline
+
+        if current:
+            unblock_network()
+            with state_lock:
+                offline = False
+        else:
+            block_network()
+            with state_lock:
+                offline = True
+
+    except Exception as error:
+
         with error_lock:
-            global pending_error
-            pending_error = "WFP 尚未初始化。"
+            pending_error = str(error)
+
         if main_hwnd:
             user32.PostMessageW(
                 main_hwnd,
@@ -1361,15 +1193,19 @@ def toggle_async():
                 0,
                 0,
             )
-        return
 
-    with state_lock:
-        if busy or shutdown_requested:
-            return
-        target = not offline
+    finally:
 
-    if wfp_controller.request(target):
-        update_ui()
+        with state_lock:
+            busy = False
+
+        if main_hwnd:
+            user32.PostMessageW(
+                main_hwnd,
+                WM_UI_REFRESH,
+                0,
+                0,
+            )
 
 
 # ============================================================
@@ -1823,7 +1659,7 @@ def keyboard_worker():
                     )
 
                     previous_any = current
-                    time.sleep(0.004)
+                    time.sleep(0.008)
                     continue
 
                 candidates = [
@@ -1856,12 +1692,12 @@ def keyboard_worker():
                     )
 
                     previous_any = current
-                    time.sleep(0.004)
+                    time.sleep(0.008)
                     continue
 
             previous_any = current
 
-            time.sleep(0.004)
+            time.sleep(0.008)
             continue
 
         # ----------------------------------------------------
@@ -1902,7 +1738,7 @@ def keyboard_worker():
             current_down
         )
 
-        time.sleep(0.004)
+        time.sleep(0.008)
 
 
 def start_keyboard_thread():
@@ -2258,7 +2094,7 @@ def update_ui():
 
         set_text(
             detail_hwnd,
-            "Windows WFP 正在阻断系统网络流量",
+            "Windows 防火墙正在阻断系统网络流量",
         )
 
     else:
@@ -3151,22 +2987,17 @@ def main():
     load_config()
 
     # --------------------------------------------------------
-    # 启动时一次性打开 WFP 动态会话。
-    # 后续断网/恢复仅通过这个常驻会话切换过滤器。
+    # 启动时只准备一次防火墙规则。
+    # 已存在则直接复用，并确保初始状态为 Disabled。
     # --------------------------------------------------------
 
     try:
         prepare_firewall_rules()
     except Exception as error:
         show_error(
-            "WFP 初始化失败",
+            "防火墙初始化失败",
             str(error),
         )
-
-        if mutex_handle:
-            kernel32.CloseHandle(mutex_handle)
-
-        return
 
     # --------------------------------------------------------
     # Window
