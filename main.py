@@ -3,7 +3,6 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -286,6 +285,273 @@ gdi32 = ctypes.WinDLL(
     "gdi32",
     use_last_error=True,
 )
+
+
+# ============================================================
+# Native Windows Firewall COM hot path
+# ============================================================
+# Runtime toggles use INetFwPolicy2 / INetFwRule directly.
+# No PowerShell/netsh process is created when the hotkey is pressed.
+# COM objects are kept on one persistent worker thread to avoid
+# repeated COM activation and cross-thread marshaling.
+
+ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+ole32.CoInitializeEx.restype = ctypes.HRESULT
+
+ole32.CoUninitialize.argtypes = []
+ole32.CoUninitialize.restype = None
+
+ole32.CoCreateInstance.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_void_p),
+]
+ole32.CoCreateInstance.restype = ctypes.HRESULT
+
+ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+ole32.CoTaskMemFree.restype = None
+
+# COM constants
+COINIT_APARTMENTTHREADED = 0x2
+CLSCTX_INPROC_SERVER = 0x1
+
+# HNetCfg.FwPolicy2
+CLSID_NetFwPolicy2 = "{E2B3C97F-6AE7-41AC-817A-F6F92166D7DD}"
+IID_INetFwPolicy2 = "{98325047-C671-4174-8D81-DEFCD3F03186}"
+IID_INetFwRules = "{9C4C6277-5027-441E-AFAE-CA1F542DA009}"
+IID_INetFwRule = "{AF8FEC54-AB7F-4A5C-AB4C-4D8E9C4D7E4A}"
+
+# INetFwRule.Enabled is a VARIANT_BOOL property.
+VARIANT_TRUE = -1
+VARIANT_FALSE = 0
+
+# IDispatch is used for the rule collection because it avoids relying on
+# undocumented Python COM packages.  The vtable layout is stable for the
+# Windows Firewall COM interfaces.
+VT_BSTR = 8
+VT_BOOL = 11
+VT_DISPATCH = 9
+VT_EMPTY = 0
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+def _guid(text):
+    g = GUID()
+    if ole32.CLSIDFromString is None:
+        raise RuntimeError("Windows COM GUID API 不可用")
+    ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(g))
+    return g
+
+ole32.CLSIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(GUID)]
+ole32.CLSIDFromString.restype = wintypes.HRESULT
+ole32.IIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(GUID)]
+ole32.IIDFromString.restype = wintypes.HRESULT
+
+def _com_release(ptr):
+    if not ptr:
+        return
+    try:
+        vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+        release(ptr)
+    except Exception:
+        pass
+
+def _com_method(ptr, index, restype, argtypes):
+    vtbl = ctypes.cast(
+        ptr,
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+    ).contents
+    return ctypes.WINFUNCTYPE(restype, *argtypes)(vtbl[index])
+
+# INetFwPolicy2:
+#   get_Rules is vtable slot 8.
+# INetFwRules:
+#   Item(BSTR name, INetFwRule**) is slot 7.
+# INetFwRule:
+#   put_Enabled(VARIANT_BOOL) is slot 7.
+#
+# These interfaces inherit IDispatch (7 base slots), hence the offsets.
+
+def _native_firewall_get_rule(policy, name):
+    rules = ctypes.c_void_p()
+    hr = _com_method(
+        policy, 8, wintypes.HRESULT,
+        [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    )(policy, ctypes.byref(rules))
+    if hr < 0:
+        raise ctypes.WinError(ctypes.get_last_error() or hr)
+
+    try:
+        rule = ctypes.c_void_p()
+        bstr = ctypes.windll.oleaut32.SysAllocString(name)
+        if not bstr:
+            raise MemoryError("无法分配规则名称")
+        try:
+            hr = _com_method(
+                rules, 7, wintypes.HRESULT,
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+            )(rules, bstr, ctypes.byref(rule))
+        finally:
+            ctypes.windll.oleaut32.SysFreeString(bstr)
+
+        if hr < 0:
+            raise RuntimeError(f"无法取得防火墙规则 {name}，HRESULT=0x{hr & 0xffffffff:08X}")
+        return rule
+    finally:
+        _com_release(rules)
+
+class NativeFirewallWorker:
+    def __init__(self):
+        self._event = threading.Event()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        self._requested = None
+        self._error = None
+        self._rule_out = None
+        self._rule_in = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="GuaguaFirewallNative",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait(5.0)
+
+        if self._error:
+            raise RuntimeError(self._error)
+
+    def _run(self):
+        hr = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        com_ok = hr >= 0 or hr == 1  # S_OK / S_FALSE
+        try:
+            if not com_ok:
+                self._error = f"COM 初始化失败，HRESULT=0x{hr & 0xffffffff:08X}"
+                return
+
+            policy = ctypes.c_void_p()
+            clsid = _guid(CLSID_NetFwPolicy2)
+            iid = _guid(IID_INetFwPolicy2)
+
+            hr = ole32.CoCreateInstance(
+                ctypes.byref(clsid),
+                None,
+                CLSCTX_INPROC_SERVER,
+                ctypes.byref(iid),
+                ctypes.byref(policy),
+            )
+            if hr < 0:
+                self._error = f"无法初始化 Windows 防火墙 COM，HRESULT=0x{hr & 0xffffffff:08X}"
+                return
+
+            try:
+                self._rule_out = _native_firewall_get_rule(policy, RULE_OUT)
+                self._rule_in = _native_firewall_get_rule(policy, RULE_IN)
+            finally:
+                _com_release(policy)
+
+            self._ready.set()
+
+            while not self._stop.is_set():
+                self._event.wait()
+                self._event.clear()
+
+                if self._stop.is_set():
+                    break
+
+                with self._lock:
+                    requested = self._requested
+                    self._requested = None
+
+                if requested is None:
+                    continue
+
+                try:
+                    value = VARIANT_TRUE if requested else VARIANT_FALSE
+
+                    put_out = _com_method(
+                        self._rule_out, 7, wintypes.HRESULT,
+                        [ctypes.c_void_p, ctypes.c_short]
+                    )
+                    put_in = _com_method(
+                        self._rule_in, 7, wintypes.HRESULT,
+                        [ctypes.c_void_p, ctypes.c_short]
+                    )
+
+                    hr1 = put_out(self._rule_out, value)
+                    if hr1 < 0:
+                        raise RuntimeError(
+                            f"启用/禁用出站规则失败，HRESULT=0x{hr1 & 0xffffffff:08X}"
+                        )
+
+                    hr2 = put_in(self._rule_in, value)
+                    if hr2 < 0:
+                        # Try to keep both rules consistent.
+                        rollback = VARIANT_FALSE if requested else VARIANT_TRUE
+                        put_out(self._rule_out, rollback)
+                        raise RuntimeError(
+                            f"启用/禁用入站规则失败，HRESULT=0x{hr2 & 0xffffffff:08X}"
+                        )
+
+                    with state_lock:
+                        global offline
+                        offline = bool(requested)
+
+                except Exception as exc:
+                    with error_lock:
+                        global pending_error
+                        pending_error = str(exc)
+                    if main_hwnd:
+                        user32.PostMessageW(main_hwnd, WM_ERROR, 0, 0)
+                finally:
+                    with state_lock:
+                        global busy
+                        busy = False
+                    if main_hwnd:
+                        user32.PostMessageW(main_hwnd, WM_UI_REFRESH, 0, 0)
+
+        except Exception as exc:
+            self._error = str(exc)
+        finally:
+            if self._rule_out:
+                _com_release(self._rule_out)
+                self._rule_out = None
+            if self._rule_in:
+                _com_release(self._rule_in)
+                self._rule_in = None
+            if com_ok:
+                ole32.CoUninitialize()
+            self._ready.set()
+
+    def set_state_async(self, enabled):
+        with state_lock:
+            if busy or shutdown_requested:
+                return False
+            busy = True
+
+        with self._lock:
+            self._requested = bool(enabled)
+        self._event.set()
+        return True
+
+    def stop(self):
+        self._stop.set()
+        self._event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+native_firewall_worker = None
 
 
 # ============================================================
@@ -860,59 +1126,19 @@ def cleanup_firewall_rules():
 def set_firewall_state(enabled):
     """
     热路径：
-      enabled=True  -> 立即启用两条预创建规则
-      enabled=False -> 立即禁用两条预创建规则
+      enabled=True  -> 启用两条预创建规则
+      enabled=False -> 禁用两条预创建规则
 
-    正常切换绝不重新创建/删除规则。
+    极速版不在这里启动 PowerShell/netsh。
+    两个规则对象在常驻 COM 线程中提前打开，热键只发送一个状态请求。
     """
-    global firewall_ready
+    global native_firewall_worker
 
-    if not firewall_ready:
-        if not prepare_firewall_rules():
-            raise RuntimeError(
-                "无法准备 Windows 防火墙规则。"
-            )
+    if native_firewall_worker is None:
+        raise RuntimeError("原生防火墙工作线程尚未初始化")
 
-    value = "$true" if enabled else "$false"
-
-    # 首选：一次 PowerShell 进程同时切换两条规则。
-    command = f"""
-Set-NetFirewallRule `
-    -Name '{RULE_OUT}','{RULE_IN}' `
-    -Enabled {value} `
-    -ErrorAction Stop
-"""
-
-    try:
-        run_powershell(command)
+    if not native_firewall_worker.set_state_async(bool(enabled)):
         return
-    except Exception as ps_error:
-
-        # 备用：Windows 原生 netsh，按精确规则名切换。
-        try:
-            state = "yes" if enabled else "no"
-
-            for name in (RULE_OUT, RULE_IN):
-                run_netsh([
-                    "advfirewall",
-                    "firewall",
-                    "set",
-                    "rule",
-                    f"name={name}",
-                    "new",
-                    f"enable={state}",
-                ])
-
-            return
-
-        except Exception as netsh_error:
-
-            raise RuntimeError(
-                "无法切换 Windows 防火墙规则。\n"
-                f"PowerShell：{ps_error}\n"
-                f"netsh：{netsh_error}"
-            )
-
 
 def block_network():
     """
@@ -945,77 +1171,31 @@ def unblock_network():
 # ============================================================
 
 def toggle_worker():
+    # 保留旧函数名，兼容 GUI/托盘调用路径。
+    with state_lock:
+        target = not offline
 
-    global busy
-    global offline
-    global pending_error
-
-    try:
-
-        with state_lock:
-            current = offline
-
-        if current:
-
-            unblock_network()
-
-            with state_lock:
-                offline = False
-
-        else:
-
-            block_network()
-
-            with state_lock:
-                offline = True
-
-    except Exception as error:
-
-        with error_lock:
-            pending_error = str(error)
-
-        if main_hwnd:
-
-            user32.PostMessageW(
-                main_hwnd,
-                WM_ERROR,
-                0,
-                0,
-            )
-
-    finally:
-
-        with state_lock:
-            busy = False
-
-        if main_hwnd:
-
-            user32.PostMessageW(
-                main_hwnd,
-                WM_UI_REFRESH,
-                0,
-                0,
-            )
+    set_firewall_state(target)
 
 
 def toggle_async():
-
     global busy
 
     with state_lock:
-
         if busy or shutdown_requested:
             return
+        target = not offline
 
-        busy = True
+    if native_firewall_worker is None:
+        with error_lock:
+            global pending_error
+            pending_error = "原生防火墙工作线程尚未初始化"
+        if main_hwnd:
+            user32.PostMessageW(main_hwnd, WM_ERROR, 0, 0)
+        return
 
-    update_ui()
-
-    threading.Thread(
-        target=toggle_worker,
-        name="GuaguaNetwork",
-        daemon=True,
-    ).start()
+    if native_firewall_worker.set_state_async(target):
+        update_ui()
 
 
 # ============================================================
@@ -1469,7 +1649,7 @@ def keyboard_worker():
                     )
 
                     previous_any = current
-                    time.sleep(0.008)
+                    time.sleep(0.004)
                     continue
 
                 candidates = [
@@ -1502,12 +1682,12 @@ def keyboard_worker():
                     )
 
                     previous_any = current
-                    time.sleep(0.008)
+                    time.sleep(0.004)
                     continue
 
             previous_any = current
 
-            time.sleep(0.008)
+            time.sleep(0.004)
             continue
 
         # ----------------------------------------------------
@@ -1548,7 +1728,7 @@ def keyboard_worker():
             current_down
         )
 
-        time.sleep(0.008)
+        time.sleep(0.004)
 
 
 def start_keyboard_thread():
@@ -2144,6 +2324,11 @@ def request_exit():
     capture_mode = False
 
     stop_keyboard_thread()
+
+    global native_firewall_worker
+    if native_firewall_worker is not None:
+        native_firewall_worker.stop()
+        native_firewall_worker = None
 
     # 无论当前 UI 状态如何，都尝试清理自己的规则。
     cleanup_firewall_rules()
