@@ -2,6 +2,7 @@
 import ctypes
 from ctypes import wintypes
 import json
+import queue
 import os
 import subprocess
 import sys
@@ -768,7 +769,7 @@ ole32.CoInitializeEx.argtypes = [
     ctypes.c_void_p,
     wintypes.DWORD,
 ]
-ole32.CoInitializeEx.restype = wintypes.HRESULT
+ole32.CoInitializeEx.restype = ctypes.c_long
 
 ole32.CoUninitialize.argtypes = []
 ole32.CoUninitialize.restype = None
@@ -780,7 +781,7 @@ ole32.CoCreateInstance.argtypes = [
     ctypes.POINTER(_GUID),
     ctypes.POINTER(ctypes.c_void_p),
 ]
-ole32.CoCreateInstance.restype = wintypes.HRESULT
+ole32.CoCreateInstance.restype = ctypes.c_long
 
 oleaut32.SysAllocString.argtypes = [wintypes.LPCWSTR]
 oleaut32.SysAllocString.restype = ctypes.c_void_p
@@ -860,7 +861,7 @@ def _dispatch_id(obj, name):
     hr = _com_method(
         obj,
         5,
-        wintypes.HRESULT,
+        ctypes.c_long,
         ctypes.POINTER(_GUID),
         ctypes.POINTER(ctypes.c_wchar_p),
         wintypes.UINT,
@@ -952,7 +953,7 @@ def _dispatch_invoke(
     hr = _com_method(
         obj,
         6,
-        wintypes.HRESULT,
+        ctypes.c_long,
         ctypes.c_long,
         ctypes.POINTER(_GUID),
         wintypes.LCID,
@@ -1024,105 +1025,151 @@ def _dispatch_put(obj, name, value):
     )
 
 
-def _wfp_com_set_state(enabled):
-    """
-    通过 Windows Firewall COM 直接切换已存在的两条规则。
-    整个热路径不启动 PowerShell / netsh。
-    """
-    policy = ctypes.c_void_p()
+_firewall_queue = queue.Queue()
+_firewall_thread = None
+_firewall_thread_lock = threading.Lock()
+
+
+def _firewall_com_thread():
+    """Persistent STA thread: initialize Firewall COM once, then reuse it."""
+    policy = None
     rules = None
     rule_out = None
     rule_in = None
-
-    hr = ole32.CoInitializeEx(
-        None,
-        0x2,  # COINIT_APARTMENTTHREADED
-    )
-
-    initialized = hr in (0, 1)
-
-    if hr < 0 and hr != 0x80010106:
-        raise OSError(
-            f"COM 初始化失败: 0x{hr & 0xFFFFFFFF:08X}"
-        )
+    item_dispid = None
+    enabled_dispid_out = None
+    enabled_dispid_in = None
+    initialized = False
 
     try:
+        hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        if hr not in (0, 1):
+            raise OSError(
+                f"COM 初始化失败: 0x{ctypes.c_ulong(hr).value:08X}"
+            )
+        initialized = True
+
+        policy = ctypes.c_void_p()
         hr = ole32.CoCreateInstance(
             ctypes.byref(_CLSID_NET_FW_POLICY2),
             None,
-            CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+            CLSCTX_INPROC_SERVER,
             ctypes.byref(_IID_IDISPATCH),
             ctypes.byref(policy),
         )
-
         if hr < 0:
             raise OSError(
-                f"Windows Firewall COM 初始化失败: "
-                f"0x{hr & 0xFFFFFFFF:08X}"
+                "Windows Firewall COM 初始化失败: "
+                f"0x{ctypes.c_ulong(hr).value:08X}"
             )
 
-        rules_variant = _dispatch_get(
-            policy,
-            "Rules",
-        )
-
-        try:
-            if rules_variant.vt != 9:
-                raise OSError(
-                    "Windows Firewall Rules 对象获取失败"
-                )
-
-            rules = ctypes.c_void_p(
-                rules_variant.data
-            )
-        finally:
+        rules_variant = _dispatch_get(policy, "Rules")
+        if rules_variant.vt != 9 or not rules_variant.data:
             _variant_clear(rules_variant)
+            raise OSError("Windows Firewall Rules 对象获取失败")
+        rules = ctypes.c_void_p(rules_variant.data)
+        rules_variant.data = 0
 
         item_dispid = _dispatch_id(rules, "Item")
 
-        for name in (RULE_OUT, RULE_IN):
+        def get_rule(name):
             result = _dispatch_invoke(
                 rules,
                 item_dispid,
                 DISPATCH_PROPERTYGET,
                 [_variant_bstr(name)],
             )
-
-            if result.vt != 9:
+            if result.vt != 9 or not result.data:
                 _variant_clear(result)
-                raise OSError(
-                    f"防火墙规则不存在: {name}"
-                )
-
+                raise OSError(f"防火墙规则不存在: {name}")
             rule = ctypes.c_void_p(result.data)
-            # 保留 VARIANT 持有的引用，最后统一 Release。
             result.data = 0
+            return rule
 
-            if name == RULE_OUT:
-                rule_out = rule
-            else:
-                rule_in = rule
+        rule_out = get_rule(RULE_OUT)
+        rule_in = get_rule(RULE_IN)
+        enabled_dispid_out = _dispatch_id(rule_out, "Enabled")
+        enabled_dispid_in = _dispatch_id(rule_in, "Enabled")
 
-        _dispatch_put(
-            rule_out,
-            "Enabled",
-            _variant_bool(enabled),
-        )
-        _dispatch_put(
-            rule_in,
-            "Enabled",
-            _variant_bool(enabled),
-        )
+        ready = True
+        ready_error = None
+    except Exception as error:
+        ready = False
+        ready_error = error
 
-    finally:
-        _com_release(rule_out)
-        _com_release(rule_in)
-        _com_release(rules)
-        _com_release(policy)
+    while True:
+        request = _firewall_queue.get()
+        if request is None:
+            break
 
-        if initialized:
-            ole32.CoUninitialize()
+        event, enabled, result_box = request
+        try:
+            if not ready:
+                raise ready_error
 
+            value = _variant_bool(bool(enabled))
+            _dispatch_invoke(
+                rule_out,
+                enabled_dispid_out,
+                DISPATCH_PROPERTYPUT,
+                [value],
+                DISPID_PROPERTYPUT,
+            )
+
+            value = _variant_bool(bool(enabled))
+            _dispatch_invoke(
+                rule_in,
+                enabled_dispid_in,
+                DISPATCH_PROPERTYPUT,
+                [value],
+                DISPID_PROPERTYPUT,
+            )
+            result_box.append(None)
+        except Exception as error:
+            result_box.append(error)
+        finally:
+            event.set()
+
+    _com_release(rule_out)
+    _com_release(rule_in)
+    _com_release(rules)
+    _com_release(policy)
+
+    if initialized:
+        ole32.CoUninitialize()
+
+
+def _ensure_firewall_com_thread():
+    global _firewall_thread
+
+    with _firewall_thread_lock:
+        if (
+            _firewall_thread is None
+            or not _firewall_thread.is_alive()
+        ):
+            _firewall_thread = threading.Thread(
+                target=_firewall_com_thread,
+                name="GuaguaFirewallCOM",
+                daemon=True,
+            )
+            _firewall_thread.start()
+
+
+def _com_set_firewall_state(enabled):
+    """Use one persistent native Windows Firewall COM STA thread."""
+    _ensure_firewall_com_thread()
+
+    event = threading.Event()
+    result_box = []
+    _firewall_queue.put(
+        (event, bool(enabled), result_box)
+    )
+
+    if not event.wait(5.0):
+        raise TimeoutError("Windows Firewall COM 操作超时")
+
+    if result_box and result_box[0] is not None:
+        raise result_box[0]
 
 def _ps_prepare_firewall():
     command = f"""
@@ -1221,7 +1268,7 @@ def cleanup_firewall_rules():
         return True
 
     try:
-        _wfp_com_set_state(False)
+        _com_set_firewall_state(False)
         firewall_ready = True
         return True
     except Exception:
@@ -1249,7 +1296,7 @@ def set_firewall_state(enabled):
             )
 
     try:
-        _wfp_com_set_state(bool(enabled))
+        _com_set_firewall_state(bool(enabled))
         return
     except Exception as com_error:
         # 仅在 COM 异常时走旧方案，保证兼容性。
