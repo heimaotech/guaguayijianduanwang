@@ -3,9 +3,11 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 
@@ -288,181 +290,515 @@ gdi32 = ctypes.WinDLL(
 
 
 # ============================================================
-# Native Windows Firewall COM hot path
+# Native Windows Filtering Platform (WFP)
 # ============================================================
-# Runtime toggles use INetFwPolicy2 / INetFwRule directly.
-# No PowerShell/netsh process is created when the hotkey is pressed.
-# COM objects are kept on one persistent worker thread to avoid
-# repeated COM activation and cross-thread marshaling.
+# Runtime network blocking is performed directly through Fwpuclnt.dll.
+# No PowerShell/netsh/Firewall COM is used by the network hot path.
+#
+# The WFP manager session is dynamic:
+#   - filters/sub-layer created by this session are removed automatically
+#     when the session closes, including process termination.
+#
+# Four IP-packet filters are used:
+#   inbound IPv4, outbound IPv4, inbound IPv6, outbound IPv6.
+# They are applied inside one WFP transaction so the block becomes
+# visible atomically rather than exposing a partial 4-filter state.
 
-ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+fwpuclnt = ctypes.WinDLL(
+    "fwpuclnt.dll",
+    use_last_error=True,
+)
 
-ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-ole32.CoInitializeEx.restype = ctypes.HRESULT
+# RPC authentication constant used by FwpmEngineOpen0.
+RPC_C_AUTHN_WINNT = 10
 
-ole32.CoUninitialize.argtypes = []
-ole32.CoUninitialize.restype = None
+# WFP constants.
+FWPM_SESSION_FLAG_DYNAMIC = 0x00000001
+FWP_EMPTY = 0
+FWP_ACTION_BLOCK = 0x00000001
 
-ole32.CoCreateInstance.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_void_p),
-]
-ole32.CoCreateInstance.restype = ctypes.HRESULT
+# Built-in management layer GUIDs.
+# Values correspond to fwpmu.h / Microsoft's management layer identifiers.
+WFP_LAYER_INBOUND_IPPACKET_V4 = "c86fd1bf-21cd-497e-a0bb-17425c885c58"
+WFP_LAYER_INBOUND_IPPACKET_V6 = "f52032cb-991c-46e7-971d-2601459a91ca"
+WFP_LAYER_OUTBOUND_IPPACKET_V4 = "1e5c9fae-8a84-4135-a331-950b54229ecd"
+WFP_LAYER_OUTBOUND_IPPACKET_V6 = "a3b3ab6b-3564-488c-9117-f34e82142763"
 
-ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
-ole32.CoTaskMemFree.restype = None
-
-# COM constants
-COINIT_APARTMENTTHREADED = 0x2
-CLSCTX_INPROC_SERVER = 0x1
-
-# HNetCfg.FwPolicy2
-CLSID_NetFwPolicy2 = "{E2B3C97F-6AE7-41AC-817A-F6F92166D7DD}"
-IID_INetFwPolicy2 = "{98325047-C671-4174-8D81-DEFCD3F03186}"
-IID_INetFwRules = "{9C4C6277-5027-441E-AFAE-CA1F542DA009}"
-IID_INetFwRule = "{AF8FEC54-AB7F-4A5C-AB4C-4D8E9C4D7E4A}"
-
-# INetFwRule.Enabled is a VARIANT_BOOL property.
-VARIANT_TRUE = -1
-VARIANT_FALSE = 0
-
-# IDispatch is used for the rule collection because it avoids relying on
-# undocumented Python COM packages.  The vtable layout is stable for the
-# Windows Firewall COM interfaces.
-VT_BSTR = 8
-VT_BOOL = 11
-VT_DISPATCH = 9
-VT_EMPTY = 0
 
 class GUID(ctypes.Structure):
     _fields_ = [
-        ("Data1", ctypes.c_ulong),
-        ("Data2", ctypes.c_ushort),
-        ("Data3", ctypes.c_ushort),
-        ("Data4", ctypes.c_ubyte * 8),
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", wintypes.BYTE * 8),
     ]
 
-def _guid(text):
+
+def guid_from_string(value):
+    u = uuid.UUID(str(value))
+    raw = u.bytes_le
     g = GUID()
-    if ole32.CLSIDFromString is None:
-        raise RuntimeError("Windows COM GUID API 不可用")
-    ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(g))
+    ctypes.memmove(ctypes.byref(g), raw, 16)
     return g
 
-ole32.CLSIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(GUID)]
-ole32.CLSIDFromString.restype = wintypes.HRESULT
-ole32.IIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(GUID)]
-ole32.IIDFromString.restype = wintypes.HRESULT
 
-def _com_release(ptr):
-    if not ptr:
+class FWPM_DISPLAY_DATA0(ctypes.Structure):
+    _fields_ = [
+        ("name", wintypes.LPWSTR),
+        ("description", wintypes.LPWSTR),
+    ]
+
+
+class FWP_BYTE_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("size", wintypes.DWORD),
+        ("data", ctypes.POINTER(wintypes.BYTE)),
+    ]
+
+
+class FWP_VALUE0_UNION(ctypes.Union):
+    _fields_ = [
+        ("uint8", wintypes.BYTE),
+        ("uint16", wintypes.WORD),
+        ("uint32", wintypes.DWORD),
+        ("uint64", ctypes.POINTER(ctypes.c_uint64)),
+        ("int8", ctypes.c_int8),
+        ("int16", ctypes.c_int16),
+        ("int32", ctypes.c_int32),
+        ("int64", ctypes.POINTER(ctypes.c_int64)),
+        ("float32", ctypes.c_float),
+        ("double64", ctypes.POINTER(ctypes.c_double)),
+        ("byteArray16", ctypes.c_void_p),
+        ("byteBlob", ctypes.POINTER(FWP_BYTE_BLOB)),
+        ("sid", ctypes.c_void_p),
+        ("sd", ctypes.POINTER(FWP_BYTE_BLOB)),
+        ("tokenInformation", ctypes.c_void_p),
+        ("tokenAccessInformation", ctypes.POINTER(FWP_BYTE_BLOB)),
+        ("unicodeString", wintypes.LPWSTR),
+        ("byteArray6", ctypes.c_void_p),
+    ]
+
+
+class FWP_VALUE0(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("value", FWP_VALUE0_UNION),
+    ]
+
+
+class FWPM_SUBLAYER0(ctypes.Structure):
+    _fields_ = [
+        ("subLayerKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", wintypes.DWORD),
+        ("providerKey", ctypes.POINTER(GUID)),
+        ("providerData", FWP_BYTE_BLOB),
+        ("weight", wintypes.WORD),
+    ]
+
+
+class FWPM_SESSION0(ctypes.Structure):
+    _fields_ = [
+        ("sessionKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", wintypes.DWORD),
+        ("txnWaitTimeoutInMSec", wintypes.DWORD),
+        ("processId", wintypes.DWORD),
+        ("sid", ctypes.c_void_p),
+        ("username", wintypes.LPWSTR),
+        ("kernelMode", wintypes.BOOL),
+    ]
+
+
+class FWPM_ACTION0_UNION(ctypes.Union):
+    _fields_ = [
+        ("filterType", GUID),
+        ("calloutKey", GUID),
+    ]
+
+
+class FWPM_ACTION0(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("value", FWPM_ACTION0_UNION),
+    ]
+
+
+class FWPM_FILTER_CONTEXT_UNION(ctypes.Union):
+    _fields_ = [
+        ("rawContext", ctypes.c_uint64),
+        ("providerContextKey", GUID),
+    ]
+
+
+class FWPM_FILTER0(ctypes.Structure):
+    _fields_ = [
+        ("filterKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", wintypes.DWORD),
+        ("providerKey", ctypes.POINTER(GUID)),
+        ("providerData", FWP_BYTE_BLOB),
+        ("layerKey", GUID),
+        ("subLayerKey", GUID),
+        ("weight", FWP_VALUE0),
+        ("numFilterConditions", wintypes.DWORD),
+        ("filterCondition", ctypes.c_void_p),
+        ("action", FWPM_ACTION0),
+        ("context", FWPM_FILTER_CONTEXT_UNION),
+        ("reserved", ctypes.POINTER(GUID)),
+        ("filterId", ctypes.c_uint64),
+        ("effectiveWeight", FWP_VALUE0),
+    ]
+
+
+# Function declarations from fwpuclnt.dll.
+fwpuclnt.FwpmEngineOpen0.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    ctypes.POINTER(FWPM_SESSION0),
+    ctypes.POINTER(HANDLE),
+]
+fwpuclnt.FwpmEngineOpen0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmEngineClose0.argtypes = [HANDLE]
+fwpuclnt.FwpmEngineClose0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmSubLayerAdd0.argtypes = [
+    HANDLE,
+    ctypes.POINTER(FWPM_SUBLAYER0),
+    ctypes.c_void_p,
+]
+fwpuclnt.FwpmSubLayerAdd0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmSubLayerDeleteByKey0.argtypes = [
+    HANDLE,
+    ctypes.POINTER(GUID),
+]
+fwpuclnt.FwpmSubLayerDeleteByKey0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmFilterAdd0.argtypes = [
+    HANDLE,
+    ctypes.POINTER(FWPM_FILTER0),
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_uint64),
+]
+fwpuclnt.FwpmFilterAdd0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmFilterDeleteById0.argtypes = [
+    HANDLE,
+    ctypes.c_uint64,
+]
+fwpuclnt.FwpmFilterDeleteById0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmTransactionBegin0.argtypes = [
+    HANDLE,
+    wintypes.DWORD,
+]
+fwpuclnt.FwpmTransactionBegin0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmTransactionCommit0.argtypes = [
+    HANDLE,
+]
+fwpuclnt.FwpmTransactionCommit0.restype = wintypes.DWORD
+
+fwpuclnt.FwpmTransactionAbort0.argtypes = [
+    HANDLE,
+]
+fwpuclnt.FwpmTransactionAbort0.restype = wintypes.DWORD
+
+
+def _wfp_raise(operation, code):
+    if code == 0:
         return
-    try:
-        vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
-        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
-        release(ptr)
-    except Exception:
-        pass
+    raise RuntimeError(
+        f"{operation} 失败：WFP 错误码 0x{int(code):08X}"
+    )
 
-def _com_method(ptr, index, restype, argtypes):
-    vtbl = ctypes.cast(
-        ptr,
-        ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
-    ).contents
-    return ctypes.WINFUNCTYPE(restype, *argtypes)(vtbl[index])
 
-# INetFwPolicy2:
-#   get_Rules is vtable slot 8.
-# INetFwRules:
-#   Item(BSTR name, INetFwRule**) is slot 7.
-# INetFwRule:
-#   put_Enabled(VARIANT_BOOL) is slot 7.
-#
-# These interfaces inherit IDispatch (7 base slots), hence the offsets.
+def _wfp_empty_value():
+    value = FWP_VALUE0()
+    value.type = FWP_EMPTY
+    value.value.uint64 = None
+    return value
 
-def _native_firewall_get_rule(policy, name):
-    rules = ctypes.c_void_p()
-    hr = _com_method(
-        policy, 8, wintypes.HRESULT,
-        [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-    )(policy, ctypes.byref(rules))
-    if hr < 0:
-        raise ctypes.WinError(ctypes.get_last_error() or hr)
 
-    try:
-        rule = ctypes.c_void_p()
-        bstr = ctypes.windll.oleaut32.SysAllocString(name)
-        if not bstr:
-            raise MemoryError("无法分配规则名称")
-        try:
-            hr = _com_method(
-                rules, 7, wintypes.HRESULT,
-                [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-            )(rules, bstr, ctypes.byref(rule))
-        finally:
-            ctypes.windll.oleaut32.SysFreeString(bstr)
+class WfpNetworkController:
+    """
+    Persistent WFP manager.
 
-        if hr < 0:
-            raise RuntimeError(f"无法取得防火墙规则 {name}，HRESULT=0x{hr & 0xffffffff:08X}")
-        return rule
-    finally:
-        _com_release(rules)
+    The worker thread owns the WFP engine handle and is the only thread
+    that mutates filters. This keeps the engine hot and removes process
+    creation / subprocess / COM overhead from the toggle path.
+    """
 
-class NativeFirewallWorker:
     def __init__(self):
         self._event = threading.Event()
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._lock = threading.Lock()
+
         self._requested = None
         self._error = None
-        self._rule_out = None
-        self._rule_in = None
+        self._engine = None
+        self._sublayer_key = None
+        self._sublayer_added = False
+        self._filter_ids = []
+
         self._thread = threading.Thread(
             target=self._run,
-            name="GuaguaFirewallNative",
+            name="GuaguaWfpWorker",
             daemon=True,
         )
         self._thread.start()
-        self._ready.wait(5.0)
+
+        if not self._ready.wait(8.0):
+            raise RuntimeError("WFP 工作线程初始化超时。")
 
         if self._error:
             raise RuntimeError(self._error)
 
-    def _run(self):
-        hr = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-        com_ok = hr >= 0 or hr == 1  # S_OK / S_FALSE
+    @property
+    def ready(self):
+        return bool(self._engine and self._sublayer_added)
+
+    def _open_engine(self):
+        session_key = GUID()
+        display_name = ctypes.create_unicode_buffer(
+            "呱呱一键断网 WFP Session"
+        )
+        display_desc = ctypes.create_unicode_buffer(
+            "临时系统网络阻断会话"
+        )
+
+        session = FWPM_SESSION0()
+        session.sessionKey = session_key
+        session.displayData = FWPM_DISPLAY_DATA0(
+            ctypes.cast(display_name, wintypes.LPWSTR),
+            ctypes.cast(display_desc, wintypes.LPWSTR),
+        )
+        session.flags = FWPM_SESSION_FLAG_DYNAMIC
+        session.txnWaitTimeoutInMSec = 2000
+        session.processId = 0
+        session.sid = None
+        session.username = None
+        session.kernelMode = False
+
+        engine = HANDLE()
+        code = fwpuclnt.FwpmEngineOpen0(
+            None,
+            RPC_C_AUTHN_WINNT,
+            None,
+            ctypes.byref(session),
+            ctypes.byref(engine),
+        )
+        _wfp_raise("FwpmEngineOpen0", code)
+        self._engine = engine
+
+        self._sublayer_key = guid_from_string(str(uuid.uuid4()))
+
+        sub_name = ctypes.create_unicode_buffer(
+            "呱呱一键断网"
+        )
+        sub_desc = ctypes.create_unicode_buffer(
+            "临时全局网络阻断子层"
+        )
+
+        sublayer = FWPM_SUBLAYER0()
+        sublayer.subLayerKey = self._sublayer_key
+        sublayer.displayData = FWPM_DISPLAY_DATA0(
+            ctypes.cast(sub_name, wintypes.LPWSTR),
+            ctypes.cast(sub_desc, wintypes.LPWSTR),
+        )
+        sublayer.flags = 0
+        sublayer.providerKey = None
+        sublayer.providerData = FWP_BYTE_BLOB(0, None)
+        sublayer.weight = 0xFFFF
+
+        code = fwpuclnt.FwpmSubLayerAdd0(
+            self._engine,
+            ctypes.byref(sublayer),
+            None,
+        )
+
+        # ERROR_ALREADY_EXISTS is not expected because the key is random.
+        _wfp_raise("FwpmSubLayerAdd0", code)
+        self._sublayer_added = True
+
+    def _make_filter(self, layer_guid, filter_name):
+        display_name = ctypes.create_unicode_buffer(filter_name)
+        display_desc = ctypes.create_unicode_buffer(
+            "按需启用时阻断系统所有 IPv4/IPv6 网络包"
+        )
+
+        filt = FWPM_FILTER0()
+        filt.filterKey = GUID()  # zero => BFE generates a runtime ID
+        filt.displayData = FWPM_DISPLAY_DATA0(
+            ctypes.cast(display_name, wintypes.LPWSTR),
+            ctypes.cast(display_desc, wintypes.LPWSTR),
+        )
+        filt.flags = 0
+        filt.providerKey = None
+        filt.providerData = FWP_BYTE_BLOB(0, None)
+        filt.layerKey = guid_from_string(layer_guid)
+        filt.subLayerKey = self._sublayer_key
+        filt.weight = _wfp_empty_value()
+        filt.numFilterConditions = 0
+        filt.filterCondition = None
+
+        action = FWPM_ACTION0()
+        action.type = FWP_ACTION_BLOCK
+        action.value.filterType = GUID()
+        filt.action = action
+
+        filt.context.rawContext = 0
+        filt.reserved = None
+        filt.filterId = 0
+        filt.effectiveWeight = _wfp_empty_value()
+
+        # Keep ctypes string buffers alive for the duration of the call.
+        return filt, display_name, display_desc
+
+    def _add_block_filters(self):
+        if self._filter_ids:
+            return
+
+        layers = (
+            (
+                WFP_LAYER_INBOUND_IPPACKET_V4,
+                "呱呱 WFP 阻断 IPv4 入站",
+            ),
+            (
+                WFP_LAYER_OUTBOUND_IPPACKET_V4,
+                "呱呱 WFP 阻断 IPv4 出站",
+            ),
+            (
+                WFP_LAYER_INBOUND_IPPACKET_V6,
+                "呱呱 WFP 阻断 IPv6 入站",
+            ),
+            (
+                WFP_LAYER_OUTBOUND_IPPACKET_V6,
+                "呱呱 WFP 阻断 IPv6 出站",
+            ),
+        )
+
+        code = fwpuclnt.FwpmTransactionBegin0(
+            self._engine,
+            0,
+        )
+        _wfp_raise("FwpmTransactionBegin0", code)
+
+        pending_ids = []
+
         try:
-            if not com_ok:
-                self._error = f"COM 初始化失败，HRESULT=0x{hr & 0xffffffff:08X}"
-                return
+            for layer_guid, name in layers:
+                filt, name_buf, desc_buf = self._make_filter(
+                    layer_guid,
+                    name,
+                )
+                filter_id = ctypes.c_uint64(0)
 
-            policy = ctypes.c_void_p()
-            clsid = _guid(CLSID_NetFwPolicy2)
-            iid = _guid(IID_INetFwPolicy2)
+                code = fwpuclnt.FwpmFilterAdd0(
+                    self._engine,
+                    ctypes.byref(filt),
+                    None,
+                    ctypes.byref(filter_id),
+                )
+                _wfp_raise("FwpmFilterAdd0", code)
 
-            hr = ole32.CoCreateInstance(
-                ctypes.byref(clsid),
-                None,
-                CLSCTX_INPROC_SERVER,
-                ctypes.byref(iid),
-                ctypes.byref(policy),
+                pending_ids.append(int(filter_id.value))
+
+            code = fwpuclnt.FwpmTransactionCommit0(
+                self._engine,
             )
-            if hr < 0:
-                self._error = f"无法初始化 Windows 防火墙 COM，HRESULT=0x{hr & 0xffffffff:08X}"
-                return
+            _wfp_raise("FwpmTransactionCommit0", code)
 
+            self._filter_ids = pending_ids
+
+        except Exception:
             try:
-                self._rule_out = _native_firewall_get_rule(policy, RULE_OUT)
-                self._rule_in = _native_firewall_get_rule(policy, RULE_IN)
-            finally:
-                _com_release(policy)
+                fwpuclnt.FwpmTransactionAbort0(
+                    self._engine
+                )
+            except Exception:
+                pass
+            raise
 
+    def _remove_block_filters(self):
+        if not self._filter_ids:
+            return
+
+        code = fwpuclnt.FwpmTransactionBegin0(
+            self._engine,
+            0,
+        )
+        _wfp_raise("FwpmTransactionBegin0", code)
+
+        ids = list(self._filter_ids)
+
+        try:
+            for filter_id in ids:
+                code = fwpuclnt.FwpmFilterDeleteById0(
+                    self._engine,
+                    ctypes.c_uint64(filter_id),
+                )
+
+                # Dynamic sessions can only delete objects belonging to
+                # the same session. All our IDs are created here.
+                _wfp_raise(
+                    f"FwpmFilterDeleteById0({filter_id})",
+                    code,
+                )
+
+            code = fwpuclnt.FwpmTransactionCommit0(
+                self._engine
+            )
+            _wfp_raise("FwpmTransactionCommit0", code)
+
+            self._filter_ids = []
+
+        except Exception:
+            try:
+                fwpuclnt.FwpmTransactionAbort0(
+                    self._engine
+                )
+            except Exception:
+                pass
+            raise
+
+    def _shutdown_wfp(self):
+        try:
+            if self._engine:
+                # If filters remain for any reason, removing them explicitly
+                # makes normal shutdown deterministic.
+                if self._filter_ids:
+                    try:
+                        self._remove_block_filters()
+                    except Exception:
+                        pass
+
+                # Dynamic session guarantees cleanup even if explicit removal
+                # could not finish.
+                fwpuclnt.FwpmEngineClose0(
+                    self._engine
+                )
+
+        finally:
+            self._engine = None
+            self._sublayer_added = False
+            self._filter_ids = []
+
+    def _run(self):
+        try:
+            self._open_engine()
+        except Exception as error:
+            self._error = str(error)
             self._ready.set()
+            return
 
+        self._ready.set()
+
+        try:
             while not self._stop.is_set():
                 self._event.wait()
                 self._event.clear()
@@ -478,63 +814,47 @@ class NativeFirewallWorker:
                     continue
 
                 try:
-                    value = VARIANT_TRUE if requested else VARIANT_FALSE
-
-                    put_out = _com_method(
-                        self._rule_out, 7, wintypes.HRESULT,
-                        [ctypes.c_void_p, ctypes.c_short]
-                    )
-                    put_in = _com_method(
-                        self._rule_in, 7, wintypes.HRESULT,
-                        [ctypes.c_void_p, ctypes.c_short]
-                    )
-
-                    hr1 = put_out(self._rule_out, value)
-                    if hr1 < 0:
-                        raise RuntimeError(
-                            f"启用/禁用出站规则失败，HRESULT=0x{hr1 & 0xffffffff:08X}"
-                        )
-
-                    hr2 = put_in(self._rule_in, value)
-                    if hr2 < 0:
-                        # Try to keep both rules consistent.
-                        rollback = VARIANT_FALSE if requested else VARIANT_TRUE
-                        put_out(self._rule_out, rollback)
-                        raise RuntimeError(
-                            f"启用/禁用入站规则失败，HRESULT=0x{hr2 & 0xffffffff:08X}"
-                        )
+                    if requested:
+                        self._add_block_filters()
+                    else:
+                        self._remove_block_filters()
 
                     with state_lock:
                         global offline
                         offline = bool(requested)
 
-                except Exception as exc:
+                except Exception as error:
                     with error_lock:
                         global pending_error
-                        pending_error = str(exc)
+                        pending_error = str(error)
+
+                    # If adding failed, guarantee the application does not
+                    # falsely report an offline state.
                     if main_hwnd:
-                        user32.PostMessageW(main_hwnd, WM_ERROR, 0, 0)
+                        user32.PostMessageW(
+                            main_hwnd,
+                            WM_ERROR,
+                            0,
+                            0,
+                        )
+
                 finally:
                     with state_lock:
                         global busy
                         busy = False
+
                     if main_hwnd:
-                        user32.PostMessageW(main_hwnd, WM_UI_REFRESH, 0, 0)
+                        user32.PostMessageW(
+                            main_hwnd,
+                            WM_UI_REFRESH,
+                            0,
+                            0,
+                        )
 
-        except Exception as exc:
-            self._error = str(exc)
         finally:
-            if self._rule_out:
-                _com_release(self._rule_out)
-                self._rule_out = None
-            if self._rule_in:
-                _com_release(self._rule_in)
-                self._rule_in = None
-            if com_ok:
-                ole32.CoUninitialize()
-            self._ready.set()
+            self._shutdown_wfp()
 
-    def set_state_async(self, enabled):
+    def request(self, enabled):
         with state_lock:
             if busy or shutdown_requested:
                 return False
@@ -542,6 +862,7 @@ class NativeFirewallWorker:
 
         with self._lock:
             self._requested = bool(enabled)
+
         self._event.set()
         return True
 
@@ -549,9 +870,10 @@ class NativeFirewallWorker:
         self._stop.set()
         self._event.set()
         if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
 
-native_firewall_worker = None
+
+wfp_controller = None
 
 
 # ============================================================
@@ -924,246 +1246,92 @@ def is_admin():
 
 
 # ============================================================
-# PowerShell + firewall
+# WFP network control
 # ============================================================
-
-def run_powershell(command):
-    process = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            command,
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            process.stderr.strip()
-            or "PowerShell 执行失败"
-        )
-
-    return process.stdout.strip()
-
-
-def run_netsh(args):
-    process = subprocess.run(
-        ["netsh", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=20,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            process.stderr.strip()
-            or process.stdout.strip()
-            or "netsh 执行失败"
-        )
-
-    return process.stdout.strip()
-
 
 firewall_ready = False
 
 
-def _ps_prepare_firewall():
-    """
-    只在程序启动阶段执行一次。
-
-    逻辑：
-      - 如果规则不存在，创建它们
-      - 如果规则已经存在，直接复用
-      - 无论之前是什么状态，最后都设为 Disabled
-    """
-    command = f"""
-$ruleOut = Get-NetFirewallRule -Name '{RULE_OUT}' -ErrorAction SilentlyContinue
-
-if (-not $ruleOut) {{
-    New-NetFirewallRule `
-        -Name '{RULE_OUT}' `
-        -DisplayName '{RULE_OUT}' `
-        -Direction Outbound `
-        -Action Block `
-        -Profile Any `
-        -Protocol Any `
-        -Enabled False `
-        -ErrorAction Stop | Out-Null
-}}
-
-$ruleIn = Get-NetFirewallRule -Name '{RULE_IN}' -ErrorAction SilentlyContinue
-
-if (-not $ruleIn) {{
-    New-NetFirewallRule `
-        -Name '{RULE_IN}' `
-        -DisplayName '{RULE_IN}' `
-        -Direction Inbound `
-        -Action Block `
-        -Profile Any `
-        -Protocol Any `
-        -Enabled False `
-        -ErrorAction Stop | Out-Null
-}}
-
-Set-NetFirewallRule `
-    -Name '{RULE_OUT}','{RULE_IN}' `
-    -Enabled False `
-    -ErrorAction Stop
-"""
-    run_powershell(command)
-
-
-def _netsh_prepare_firewall():
-    """
-    PowerShell 不可用时的备用初始化方式。
-    已存在的规则不重复创建。
-    """
-    for name, direction in (
-        (RULE_OUT, "out"),
-        (RULE_IN, "in"),
-    ):
-        try:
-            run_netsh([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                f"name={name}",
-                f"dir={direction}",
-                "action=block",
-                "enable=no",
-                "profile=any",
-                "protocol=any",
-            ])
-        except Exception:
-            # 规则已存在时 add 会失败，随后 set 会统一处理。
-            pass
-
-    for name in (RULE_OUT, RULE_IN):
-        run_netsh([
-            "advfirewall",
-            "firewall",
-            "set",
-            "rule",
-            f"name={name}",
-            "new",
-            "enable=no",
-        ])
-
-
 def prepare_firewall_rules():
     """
-    程序启动时准备规则。
-    只创建一次；正常断网/恢复不再创建或删除规则。
+    Compatibility wrapper retained for the existing startup flow.
+
+    The old implementation created Windows Firewall rules through PowerShell.
+    The WFP controller now opens a dynamic native WFP session and creates its
+    private high-weight sub-layer. No network-blocking rules are created via
+    PowerShell.
     """
     global firewall_ready
+    global wfp_controller
 
-    try:
-        _ps_prepare_firewall()
+    if wfp_controller is not None and wfp_controller.ready:
         firewall_ready = True
         return True
-    except Exception as ps_error:
-        try:
-            _netsh_prepare_firewall()
-            firewall_ready = True
-            return True
-        except Exception as netsh_error:
-            firewall_ready = False
-            raise RuntimeError(
-                "无法准备 Windows 防火墙规则。\n"
-                f"PowerShell：{ps_error}\n"
-                f"netsh：{netsh_error}"
-            )
+
+    wfp_controller = WfpNetworkController()
+    firewall_ready = True
+    return True
 
 
 def cleanup_firewall_rules():
     """
-    退出/启动时只负责把本程序自己的规则设为 Disabled，
-    不删除规则，这样下一次运行可以直接复用。
+    Compatibility wrapper retained for existing shutdown paths.
+
+    Closing the dynamic WFP session removes all WFP objects created by this
+    process automatically. If the network is currently blocked, the worker
+    first attempts to remove the filters before the engine is closed.
     """
     global firewall_ready
+    global wfp_controller
+
+    controller = wfp_controller
+    wfp_controller = None
+
+    if controller is None:
+        firewall_ready = False
+        return True
 
     try:
-        run_powershell(
-            f"Set-NetFirewallRule "
-            f"-Name '{RULE_OUT}','{RULE_IN}' "
-            f"-Enabled False "
-            f"-ErrorAction SilentlyContinue"
-        )
-        firewall_ready = True
+        controller.stop()
+        firewall_ready = False
         return True
     except Exception:
-        try:
-            for name in (RULE_OUT, RULE_IN):
-                run_netsh([
-                    "advfirewall",
-                    "firewall",
-                    "set",
-                    "rule",
-                    f"name={name}",
-                    "new",
-                    "enable=no",
-                ])
-            firewall_ready = True
-            return True
-        except Exception:
-            firewall_ready = False
-            return False
+        firewall_ready = False
+        return False
 
 
 def set_firewall_state(enabled):
     """
-    热路径：
-      enabled=True  -> 启用两条预创建规则
-      enabled=False -> 禁用两条预创建规则
+    Native WFP hot path.
 
-    极速版不在这里启动 PowerShell/netsh。
-    两个规则对象在常驻 COM 线程中提前打开，热键只发送一个状态请求。
+    enabled=True:
+        Add four terminating BLOCK filters in one transaction.
+
+    enabled=False:
+        Remove those four filters in one transaction.
     """
-    global native_firewall_worker
+    if not firewall_ready:
+        raise RuntimeError("WFP 尚未初始化。")
 
-    if native_firewall_worker is None:
-        raise RuntimeError("原生防火墙工作线程尚未初始化")
-
-    if not native_firewall_worker.set_state_async(bool(enabled)):
-        return
-
-def block_network():
-    """
-    启用预创建的阻断规则。
-    不创建规则，不删除规则，不碰网卡。
-    """
-    global offline
-
-    set_firewall_state(True)
+    if wfp_controller is None:
+        raise RuntimeError("WFP 控制器不可用。")
 
     with state_lock:
-        offline = True
+        current = offline
+
+    if bool(current) == bool(enabled):
+        return
+
+    if not wfp_controller.request(bool(enabled)):
+        raise RuntimeError("WFP 切换请求未被接受。")
+
+
+def block_network():
+    set_firewall_state(True)
 
 
 def unblock_network():
-    """
-    禁用预创建的阻断规则。
-    不创建规则，不删除规则，不碰网卡。
-    """
-    global offline
-
     set_firewall_state(False)
-
-    with state_lock:
-        offline = False
 
 
 # ============================================================
@@ -1171,7 +1339,10 @@ def unblock_network():
 # ============================================================
 
 def toggle_worker():
-    # 保留旧函数名，兼容 GUI/托盘调用路径。
+    """
+    Compatibility wrapper: the actual work is performed by the persistent
+    WFP controller thread.
+    """
     with state_lock:
         target = not offline
 
@@ -1179,22 +1350,25 @@ def toggle_worker():
 
 
 def toggle_async():
-    global busy
+    if wfp_controller is None:
+        with error_lock:
+            global pending_error
+            pending_error = "WFP 尚未初始化。"
+        if main_hwnd:
+            user32.PostMessageW(
+                main_hwnd,
+                WM_ERROR,
+                0,
+                0,
+            )
+        return
 
     with state_lock:
         if busy or shutdown_requested:
             return
         target = not offline
 
-    if native_firewall_worker is None:
-        with error_lock:
-            global pending_error
-            pending_error = "原生防火墙工作线程尚未初始化"
-        if main_hwnd:
-            user32.PostMessageW(main_hwnd, WM_ERROR, 0, 0)
-        return
-
-    if native_firewall_worker.set_state_async(target):
+    if wfp_controller.request(target):
         update_ui()
 
 
@@ -2084,7 +2258,7 @@ def update_ui():
 
         set_text(
             detail_hwnd,
-            "Windows 防火墙正在阻断系统网络流量",
+            "Windows WFP 正在阻断系统网络流量",
         )
 
     else:
@@ -2324,11 +2498,6 @@ def request_exit():
     capture_mode = False
 
     stop_keyboard_thread()
-
-    global native_firewall_worker
-    if native_firewall_worker is not None:
-        native_firewall_worker.stop()
-        native_firewall_worker = None
 
     # 无论当前 UI 状态如何，都尝试清理自己的规则。
     cleanup_firewall_rules()
@@ -2982,17 +3151,22 @@ def main():
     load_config()
 
     # --------------------------------------------------------
-    # 启动时只准备一次防火墙规则。
-    # 已存在则直接复用，并确保初始状态为 Disabled。
+    # 启动时一次性打开 WFP 动态会话。
+    # 后续断网/恢复仅通过这个常驻会话切换过滤器。
     # --------------------------------------------------------
 
     try:
         prepare_firewall_rules()
     except Exception as error:
         show_error(
-            "防火墙初始化失败",
+            "WFP 初始化失败",
             str(error),
         )
+
+        if mutex_handle:
+            kernel32.CloseHandle(mutex_handle)
+
+        return
 
     # --------------------------------------------------------
     # Window
