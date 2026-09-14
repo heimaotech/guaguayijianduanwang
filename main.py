@@ -2,7 +2,6 @@
 import ctypes
 from ctypes import wintypes
 import json
-import queue
 import os
 import subprocess
 import sys
@@ -43,11 +42,6 @@ WINDOW_HEIGHT = 600
 # 默认 Home
 DEFAULT_VK = 0x24
 DEFAULT_MOD = 0x0000
-
-# 防火墙规则使用精确 Name。
-# 只操作这两条规则。
-RULE_OUT = "GuaguaNetToggle_Block_Outbound"
-RULE_IN = "GuaguaNetToggle_Block_Inbound"
 
 # 控件 ID
 ID_BTN_TOGGLE = 3001
@@ -660,8 +654,7 @@ def is_admin():
 
 # ============================================================
 # Windows Firewall
-# 启动阶段允许 PowerShell 创建/检查规则；
-# 热路径使用原生 COM，不再启动 PowerShell / netsh。
+
 # ============================================================
 
 def run_powershell(command):
@@ -713,633 +706,396 @@ def run_netsh(args):
     return process.stdout.strip()
 
 
-firewall_ready = False
+# ============================================================
+# Native IP route network control
+# ============================================================
+# 热路径只使用 iphlpapi.dll / netioapi API：
+#   GetIpForwardTable2
+#   CreateIpForwardEntry2
+#   DeleteIpForwardEntry2
+# 不启动 PowerShell / netsh，不操作 Windows Firewall。
+#
+# 断网策略：在 Windows Loopback 接口上临时加入更具体的 /1 黑洞路由。
+# IPv4: 0.0.0.0/1 + 128.0.0.0/1
+# IPv6: ::/1 + 8000::/1
+# /1 比默认路由 /0 更具体，因此不会修改或删除用户原有默认路由。
+# 恢复时只删除本程序创建的四条路由。
+
+AF_INET = 2
+AF_INET6 = 23
+
+MIB_IPPROTO_NETMGMT = 3
+NLRO_MANUAL = 0
+INFINITE_LIFETIME = 0xFFFFFFFF
+
+ERROR_FILE_NOT_FOUND = 2
+ERROR_OBJECT_ALREADY_EXISTS = 5010
+ERROR_ROUTE_EXISTS = 5013
 
 
-# ------------------------------------------------------------
-# COM / Windows Firewall native automation
-# ------------------------------------------------------------
-
-class _GUID(ctypes.Structure):
+class _IN_ADDR(ctypes.Union):
     _fields_ = [
-        ("Data1", ctypes.c_uint32),
-        ("Data2", ctypes.c_uint16),
-        ("Data3", ctypes.c_uint16),
-        ("Data4", ctypes.c_ubyte * 8),
+        ("Byte", ctypes.c_ubyte * 4),
+        ("Word", ctypes.c_ushort * 2),
+        ("Addr", ctypes.c_ulong),
     ]
 
 
-class _VARIANT(ctypes.Structure):
+class _IN6_ADDR(ctypes.Union):
     _fields_ = [
-        ("vt", ctypes.c_ushort),
-        ("r1", ctypes.c_ushort),
-        ("r2", ctypes.c_ushort),
-        ("r3", ctypes.c_ushort),
-        ("data", ctypes.c_uint64),
+        ("Byte", ctypes.c_ubyte * 16),
+        ("Word", ctypes.c_ushort * 8),
     ]
 
 
-class _DISPPARAMS(ctypes.Structure):
+class _SOCKADDR_IN(ctypes.Structure):
     _fields_ = [
-        ("rgvarg", ctypes.POINTER(_VARIANT)),
-        ("rgdispidNamedArgs", ctypes.POINTER(ctypes.c_long)),
-        ("cArgs", ctypes.c_uint32),
-        ("cNamedArgs", ctypes.c_uint32),
+        ("sin_family", ctypes.c_ushort),
+        ("sin_port", ctypes.c_ushort),
+        ("sin_addr", _IN_ADDR),
+        ("sin_zero", ctypes.c_ubyte * 8),
     ]
 
 
-class _EXCEPINFO(ctypes.Structure):
+class _SOCKADDR_IN6(ctypes.Structure):
     _fields_ = [
-        ("wCode", ctypes.c_ushort),
-        ("wReserved", ctypes.c_ushort),
-        ("bstrSource", ctypes.c_void_p),
-        ("bstrDescription", ctypes.c_void_p),
-        ("bstrHelpFile", ctypes.c_void_p),
-        ("dwHelpContext", ctypes.c_uint32),
-        ("pvReserved", ctypes.c_void_p),
-        ("pfnDeferredFillIn", ctypes.c_void_p),
-        ("scode", ctypes.c_int32),
+        ("sin6_family", ctypes.c_ushort),
+        ("sin6_port", ctypes.c_ushort),
+        ("sin6_flowinfo", ctypes.c_ulong),
+        ("sin6_addr", _IN6_ADDR),
+        ("sin6_scope_id", ctypes.c_ulong),
     ]
 
 
-ole32 = ctypes.WinDLL("ole32", use_last_error=True)
-oleaut32 = ctypes.WinDLL("oleaut32", use_last_error=True)
+class _SOCKADDR_INET(ctypes.Union):
+    _fields_ = [
+        ("Ipv4", _SOCKADDR_IN),
+        ("Ipv6", _SOCKADDR_IN6),
+    ]
 
-ole32.CoInitializeEx.argtypes = [
-    ctypes.c_void_p,
-    wintypes.DWORD,
-]
-ole32.CoInitializeEx.restype = ctypes.c_long
 
-ole32.CoUninitialize.argtypes = []
-ole32.CoUninitialize.restype = None
+class _IP_ADDRESS_PREFIX(ctypes.Structure):
+    _fields_ = [
+        ("Prefix", _SOCKADDR_INET),
+        ("PrefixLength", ctypes.c_ubyte),
+    ]
 
-ole32.CoCreateInstance.argtypes = [
-    ctypes.POINTER(_GUID),
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    ctypes.POINTER(_GUID),
+
+class _MIB_IPFORWARD_ROW2(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceLuid", ctypes.c_ulonglong),
+        ("InterfaceIndex", ctypes.c_ulong),
+        ("DestinationPrefix", _IP_ADDRESS_PREFIX),
+        ("NextHop", _SOCKADDR_INET),
+        ("SitePrefixLength", ctypes.c_ubyte),
+        ("ValidLifetime", ctypes.c_ulong),
+        ("PreferredLifetime", ctypes.c_ulong),
+        ("Metric", ctypes.c_ulong),
+        ("Protocol", ctypes.c_ulong),
+        ("Loopback", ctypes.c_ubyte),
+        ("AutoconfigureAddress", ctypes.c_ubyte),
+        ("Publish", ctypes.c_ubyte),
+        ("Immortal", ctypes.c_ubyte),
+        ("Age", ctypes.c_ulong),
+        ("Origin", ctypes.c_ulong),
+    ]
+
+
+class _MIB_IPFORWARD_TABLE2_HEADER(ctypes.Structure):
+    _fields_ = [
+        ("NumEntries", ctypes.c_ulong),
+    ]
+
+
+iphlpapi = ctypes.WinDLL("iphlpapi.dll", use_last_error=True)
+
+iphlpapi.GetIpForwardTable2.argtypes = [
+    ctypes.c_ushort,
     ctypes.POINTER(ctypes.c_void_p),
 ]
-ole32.CoCreateInstance.restype = ctypes.c_long
+iphlpapi.GetIpForwardTable2.restype = ctypes.c_ulong
 
-oleaut32.SysAllocString.argtypes = [wintypes.LPCWSTR]
-oleaut32.SysAllocString.restype = ctypes.c_void_p
+iphlpapi.FreeMibTable.argtypes = [ctypes.c_void_p]
+iphlpapi.FreeMibTable.restype = None
 
-oleaut32.SysFreeString.argtypes = [ctypes.c_void_p]
-oleaut32.SysFreeString.restype = None
+iphlpapi.InitializeIpForwardEntry.argtypes = [
+    ctypes.POINTER(_MIB_IPFORWARD_ROW2),
+]
+iphlpapi.InitializeIpForwardEntry.restype = None
 
+iphlpapi.CreateIpForwardEntry2.argtypes = [
+    ctypes.POINTER(_MIB_IPFORWARD_ROW2),
+]
+iphlpapi.CreateIpForwardEntry2.restype = ctypes.c_ulong
 
-_COM_IUNKNOWN = _GUID(
-    0x00000000,
-    0x0000,
-    0x0000,
-    (ctypes.c_ubyte * 8)(0, 0, 0, 0, 0, 0, 0, 0),
-)
+iphlpapi.DeleteIpForwardEntry2.argtypes = [
+    ctypes.POINTER(_MIB_IPFORWARD_ROW2),
+]
+iphlpapi.DeleteIpForwardEntry2.restype = ctypes.c_ulong
 
-_CLSID_NET_FW_POLICY2 = _GUID(
-    0xE2B3C97F,
-    0x6AE1,
-    0x41AC,
-    (ctypes.c_ubyte * 8)(
-        0x81, 0x7A, 0xF6, 0x92, 0x16, 0x6D, 0xD7, 0xDD
+route_ready = False
+route_lock = threading.RLock()
+route_interfaces = {}
+route_rows = {}
+
+# 本程序专用前缀。用 /1 覆盖整个 IPv4 / IPv6 地址空间，
+# 但不碰用户自己的默认路由；恢复只删除本程序建立的这些对象。
+_ROUTE_PREFIXES = {
+    AF_INET: (
+        (bytes((0, 0, 0, 0)), 1),
+        (bytes((128, 0, 0, 0)), 1),
     ),
-)
-
-_IID_IDISPATCH = _GUID(
-    0x00020400,
-    0x0000,
-    0x0000,
-    (ctypes.c_ubyte * 8)(0xC0, 0, 0, 0, 0, 0, 0, 0x46),
-)
-
-CLSCTX_INPROC_SERVER = 0x1
-CLSCTX_LOCAL_SERVER = 0x4
-
-DISPATCH_METHOD = 0x1
-DISPATCH_PROPERTYGET = 0x2
-DISPATCH_PROPERTYPUT = 0x4
-DISPID_PROPERTYPUT = -3
-
-VT_EMPTY = 0
-VT_BOOL = 11
-VT_BSTR = 8
+    AF_INET6: (
+        (bytes(16), 1),
+        (bytes((0x80,)) + bytes(15), 1),
+    ),
+}
 
 
-def _com_method(obj, index, restype, *argtypes):
-    vtable = ctypes.cast(
-        obj,
-        ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
-    ).contents
-
-    prototype = ctypes.CFUNCTYPE(
-        restype,
-        ctypes.c_void_p,
-        *argtypes,
+def _route_error(code, operation):
+    if code == 0:
+        return
+    try:
+        message = ctypes.FormatError(code).strip()
+    except Exception:
+        message = "未知错误"
+    raise OSError(
+        f"{operation} 失败: {code} ({message})"
     )
 
-    return prototype(vtable[index])
 
-
-def _com_release(obj):
-    if obj:
-        try:
-            _com_method(
-                obj,
-                2,
-                wintypes.ULONG,
-            )(obj)
-        except Exception:
-            pass
-
-
-def _dispatch_id(obj, name):
-    name_buffer = ctypes.create_unicode_buffer(name)
-    names = (ctypes.c_wchar_p * 1)(name_buffer)
-    dispid = ctypes.c_long()
-
-    hr = _com_method(
-        obj,
-        5,
-        ctypes.c_long,
-        ctypes.POINTER(_GUID),
-        ctypes.POINTER(ctypes.c_wchar_p),
-        wintypes.UINT,
-        wintypes.LCID,
-        ctypes.POINTER(ctypes.c_long),
-    )(
-        obj,
-        ctypes.byref(_COM_IUNKNOWN),
-        names,
-        1,
+def _set_sockaddr_zero(sockaddr, family):
+    ctypes.memset(
+        ctypes.byref(sockaddr),
         0,
-        ctypes.byref(dispid),
+        ctypes.sizeof(_SOCKADDR_INET),
     )
-
-    if hr < 0:
-        raise OSError(
-            f"COM GetIDsOfNames 失败: 0x{hr & 0xFFFFFFFF:08X}"
-        )
-
-    return dispid.value
+    if family == AF_INET:
+        sockaddr.Ipv4.sin_family = AF_INET
+    else:
+        sockaddr.Ipv6.sin6_family = AF_INET6
 
 
-def _variant_bstr(text):
-    value = _VARIANT()
-    value.vt = VT_BSTR
-    value.data = int(
-        oleaut32.SysAllocString(str(text))
+def _set_prefix(row, family, address, prefix_length):
+    _set_sockaddr_zero(row.DestinationPrefix.Prefix, family)
+    if family == AF_INET:
+        for i, value in enumerate(address):
+            row.DestinationPrefix.Prefix.Ipv4.sin_addr.Byte[i] = value
+    else:
+        for i, value in enumerate(address):
+            row.DestinationPrefix.Prefix.Ipv6.sin6_addr.Byte[i] = value
+    row.DestinationPrefix.PrefixLength = prefix_length
+
+
+def _set_nexthop_zero(row, family):
+    _set_sockaddr_zero(row.NextHop, family)
+
+
+def _get_route_table(family=0):
+    table = ctypes.c_void_p()
+    code = iphlpapi.GetIpForwardTable2(
+        family,
+        ctypes.byref(table),
     )
-    if not value.data:
-        raise MemoryError("无法分配 BSTR")
-    return value
+    _route_error(code, "GetIpForwardTable2")
+
+    try:
+        header = ctypes.cast(
+            table,
+            ctypes.POINTER(_MIB_IPFORWARD_TABLE2_HEADER),
+        ).contents
+        count = int(header.NumEntries)
+        if count <= 0:
+            return []
+
+        # MIB_IPFORWARD_TABLE2 的第一个 Row 需要按结构体对齐。
+        offset = ctypes.sizeof(_MIB_IPFORWARD_TABLE2_HEADER)
+        alignment = ctypes.alignment(_MIB_IPFORWARD_ROW2)
+        offset = (offset + alignment - 1) & ~(alignment - 1)
+
+        base = int(table.value) + offset
+        result = []
+        for index in range(count):
+            address = base + index * ctypes.sizeof(_MIB_IPFORWARD_ROW2)
+            result.append(
+                ctypes.cast(
+                    address,
+                    ctypes.POINTER(_MIB_IPFORWARD_ROW2),
+                ).contents
+            )
+        return result
+    finally:
+        iphlpapi.FreeMibTable(table)
 
 
-def _variant_bool(value):
-    result = _VARIANT()
-    result.vt = VT_BOOL
-    result.data = ctypes.c_uint64(
-        0xFFFFFFFFFFFFFFFF if value else 0
-    ).value
+def _route_family(row):
+    family = int(row.DestinationPrefix.Prefix.Ipv4.sin_family)
+    if family in (AF_INET, AF_INET6):
+        return family
+    return 0
+
+
+def _find_loopback_interfaces():
+    result = {}
+    for row in _get_route_table(0):
+        if not row.Loopback:
+            continue
+        family = _route_family(row)
+        if family not in (AF_INET, AF_INET6):
+            continue
+        if family not in result:
+            result[family] = (
+                int(row.InterfaceLuid),
+                int(row.InterfaceIndex),
+            )
     return result
 
 
-def _variant_clear(value):
-    # 本程序只创建 BSTR / BOOL 两种 VARIANT。
-    if value.vt == VT_BSTR and value.data:
-        oleaut32.SysFreeString(
-            ctypes.c_void_p(value.data)
-        )
-        value.data = 0
+def _build_sink_row(family, luid, if_index, address, prefix_length):
+    row = _MIB_IPFORWARD_ROW2()
+    iphlpapi.InitializeIpForwardEntry(ctypes.byref(row))
+
+    row.InterfaceLuid = luid
+    row.InterfaceIndex = if_index
+    _set_prefix(row, family, address, prefix_length)
+    _set_nexthop_zero(row, family)
+
+    row.SitePrefixLength = prefix_length
+    row.ValidLifetime = INFINITE_LIFETIME
+    row.PreferredLifetime = INFINITE_LIFETIME
+    row.Metric = 0
+    row.Protocol = MIB_IPPROTO_NETMGMT
+    row.Loopback = 1
+    row.AutoconfigureAddress = 0
+    row.Publish = 0
+    row.Immortal = 1
+    row.Origin = NLRO_MANUAL
+    return row
 
 
-def _dispatch_invoke(
-    obj,
-    dispid,
-    flags,
-    args=None,
-    named_dispid=None,
-):
-    args = args or []
-
-    if args:
-        argv = (_VARIANT * len(args))(*args)
-        argv_ptr = ctypes.cast(
-            argv,
-            ctypes.POINTER(_VARIANT),
-        )
-    else:
-        argv = None
-        argv_ptr = None
-
-    if named_dispid is None:
-        named = None
-        named_count = 0
-    else:
-        named = ctypes.c_long(named_dispid)
-        named_count = 1
-
-    params = _DISPPARAMS(
-        argv_ptr,
-        ctypes.byref(named) if named else None,
-        len(args),
-        named_count,
-    )
-
-    result = _VARIANT()
-    excep = _EXCEPINFO()
-    arg_error = ctypes.c_uint32()
-
-    hr = _com_method(
-        obj,
-        6,
-        ctypes.c_long,
-        ctypes.c_long,
-        ctypes.POINTER(_GUID),
-        wintypes.LCID,
-        wintypes.WORD,
-        ctypes.POINTER(_DISPPARAMS),
-        ctypes.POINTER(_VARIANT),
-        ctypes.POINTER(_EXCEPINFO),
-        ctypes.POINTER(ctypes.c_uint32),
-    )(
-        obj,
-        dispid,
-        ctypes.byref(_COM_IUNKNOWN),
-        0,
-        flags,
-        ctypes.byref(params),
-        ctypes.byref(result),
-        ctypes.byref(excep),
-        ctypes.byref(arg_error),
-    )
-
-    for value in args:
-        _variant_clear(value)
-
-    if hr < 0:
-        description = ""
-        if excep.bstrDescription:
-            description = ctypes.wstring_at(
-                excep.bstrDescription
-            )
-            oleaut32.SysFreeString(
-                excep.bstrDescription
-            )
-
-        raise OSError(
-            f"COM Invoke 失败: 0x{hr & 0xFFFFFFFF:08X}"
-            + (f" {description}" if description else "")
-        )
-
-    return result
+def _route_key(family, address, prefix_length):
+    return (family, address, prefix_length)
 
 
-def _dispatch_get(obj, name):
-    dispid = _dispatch_id(obj, name)
-    return _dispatch_invoke(
-        obj,
-        dispid,
-        DISPATCH_PROPERTYGET,
-    )
+def prepare_route_control():
+    """启动时只发现 Loopback 接口，不修改路由表。"""
+    global route_ready, route_interfaces
 
-
-def _dispatch_call(obj, name, *args):
-    dispid = _dispatch_id(obj, name)
-    return _dispatch_invoke(
-        obj,
-        dispid,
-        DISPATCH_METHOD,
-        list(args),
-    )
-
-
-def _dispatch_put(obj, name, value):
-    dispid = _dispatch_id(obj, name)
-    return _dispatch_invoke(
-        obj,
-        dispid,
-        DISPATCH_PROPERTYPUT,
-        [value],
-        DISPID_PROPERTYPUT,
-    )
-
-
-_firewall_queue = queue.Queue()
-_firewall_thread = None
-_firewall_thread_lock = threading.Lock()
-
-
-def _firewall_com_thread():
-    """Persistent STA thread: initialize Firewall COM once, then reuse it."""
-    policy = None
-    rules = None
-    rule_out = None
-    rule_in = None
-    item_dispid = None
-    enabled_dispid_out = None
-    enabled_dispid_in = None
-    initialized = False
-
-    try:
-        hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
-        if hr not in (0, 1):
-            raise OSError(
-                f"COM 初始化失败: 0x{ctypes.c_ulong(hr).value:08X}"
-            )
-        initialized = True
-
-        policy = ctypes.c_void_p()
-        hr = ole32.CoCreateInstance(
-            ctypes.byref(_CLSID_NET_FW_POLICY2),
-            None,
-            CLSCTX_INPROC_SERVER,
-            ctypes.byref(_IID_IDISPATCH),
-            ctypes.byref(policy),
-        )
-        if hr < 0:
-            raise OSError(
-                "Windows Firewall COM 初始化失败: "
-                f"0x{ctypes.c_ulong(hr).value:08X}"
-            )
-
-        rules_variant = _dispatch_get(policy, "Rules")
-        if rules_variant.vt != 9 or not rules_variant.data:
-            _variant_clear(rules_variant)
-            raise OSError("Windows Firewall Rules 对象获取失败")
-        rules = ctypes.c_void_p(rules_variant.data)
-        rules_variant.data = 0
-
-        item_dispid = _dispatch_id(rules, "Item")
-
-        def get_rule(name):
-            result = _dispatch_invoke(
-                rules,
-                item_dispid,
-                DISPATCH_PROPERTYGET,
-                [_variant_bstr(name)],
-            )
-            if result.vt != 9 or not result.data:
-                _variant_clear(result)
-                raise OSError(f"防火墙规则不存在: {name}")
-            rule = ctypes.c_void_p(result.data)
-            result.data = 0
-            return rule
-
-        rule_out = get_rule(RULE_OUT)
-        rule_in = get_rule(RULE_IN)
-        enabled_dispid_out = _dispatch_id(rule_out, "Enabled")
-        enabled_dispid_in = _dispatch_id(rule_in, "Enabled")
-
-        ready = True
-        ready_error = None
-    except Exception as error:
-        ready = False
-        ready_error = error
-
-    while True:
-        request = _firewall_queue.get()
-        if request is None:
-            break
-
-        event, enabled, result_box = request
-        try:
-            if not ready:
-                raise ready_error
-
-            value = _variant_bool(bool(enabled))
-            _dispatch_invoke(
-                rule_out,
-                enabled_dispid_out,
-                DISPATCH_PROPERTYPUT,
-                [value],
-                DISPID_PROPERTYPUT,
-            )
-
-            value = _variant_bool(bool(enabled))
-            _dispatch_invoke(
-                rule_in,
-                enabled_dispid_in,
-                DISPATCH_PROPERTYPUT,
-                [value],
-                DISPID_PROPERTYPUT,
-            )
-            result_box.append(None)
-        except Exception as error:
-            result_box.append(error)
-        finally:
-            event.set()
-
-    _com_release(rule_out)
-    _com_release(rule_in)
-    _com_release(rules)
-    _com_release(policy)
-
-    if initialized:
-        ole32.CoUninitialize()
-
-
-def _ensure_firewall_com_thread():
-    global _firewall_thread
-
-    with _firewall_thread_lock:
-        if (
-            _firewall_thread is None
-            or not _firewall_thread.is_alive()
-        ):
-            _firewall_thread = threading.Thread(
-                target=_firewall_com_thread,
-                name="GuaguaFirewallCOM",
-                daemon=True,
-            )
-            _firewall_thread.start()
-
-
-def _com_set_firewall_state(enabled):
-    """Use one persistent native Windows Firewall COM STA thread."""
-    _ensure_firewall_com_thread()
-
-    event = threading.Event()
-    result_box = []
-    _firewall_queue.put(
-        (event, bool(enabled), result_box)
-    )
-
-    if not event.wait(5.0):
-        raise TimeoutError("Windows Firewall COM 操作超时")
-
-    if result_box and result_box[0] is not None:
-        raise result_box[0]
-
-def _ps_prepare_firewall():
-    command = f"""
-$ruleOut = Get-NetFirewallRule -Name '{RULE_OUT}' -ErrorAction SilentlyContinue
-if (-not $ruleOut) {{
-    New-NetFirewallRule `
-        -Name '{RULE_OUT}' `
-        -DisplayName '{RULE_OUT}' `
-        -Direction Outbound `
-        -Action Block `
-        -Profile Any `
-        -Protocol Any `
-        -Enabled False `
-        -ErrorAction Stop | Out-Null
-}}
-
-$ruleIn = Get-NetFirewallRule -Name '{RULE_IN}' -ErrorAction SilentlyContinue
-if (-not $ruleIn) {{
-    New-NetFirewallRule `
-        -Name '{RULE_IN}' `
-        -DisplayName '{RULE_IN}' `
-        -Direction Inbound `
-        -Action Block `
-        -Profile Any `
-        -Protocol Any `
-        -Enabled False `
-        -ErrorAction Stop | Out-Null
-}}
-
-Set-NetFirewallRule `
-    -Name '{RULE_OUT}','{RULE_IN}' `
-    -Enabled False `
-    -ErrorAction Stop
-"""
-    run_powershell(command)
-
-
-def _netsh_prepare_firewall():
-    for name, direction in (
-        (RULE_OUT, "out"),
-        (RULE_IN, "in"),
-    ):
-        try:
-            run_netsh([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                f"name={name}",
-                f"dir={direction}",
-                "action=block",
-                "enable=no",
-                "profile=any",
-                "protocol=any",
-            ])
-        except Exception:
-            pass
-
-    for name in (RULE_OUT, RULE_IN):
-        run_netsh([
-            "advfirewall",
-            "firewall",
-            "set",
-            "rule",
-            f"name={name}",
-            "new",
-            "enable=no",
-        ])
-
-
-def prepare_firewall_rules():
-    global firewall_ready
-
-    try:
-        _ps_prepare_firewall()
-        firewall_ready = True
-        return True
-    except Exception as ps_error:
-        try:
-            _netsh_prepare_firewall()
-            firewall_ready = True
-            return True
-        except Exception as netsh_error:
-            firewall_ready = False
+    with route_lock:
+        route_interfaces = _find_loopback_interfaces()
+        missing = [
+            family
+            for family in (AF_INET, AF_INET6)
+            if family not in route_interfaces
+        ]
+        if missing:
+            route_ready = False
+            families = ", ".join(str(x) for x in missing)
             raise RuntimeError(
-                "无法准备 Windows 防火墙规则。\n"
-                f"PowerShell：{ps_error}\n"
-                f"netsh：{netsh_error}"
+                "无法定位 Windows Loopback 接口，缺少地址族: "
+                + families
+            )
+        route_ready = True
+        return True
+
+
+def _ensure_route_control():
+    if not route_ready:
+        prepare_route_control()
+
+
+def _create_sink_routes():
+    _ensure_route_control()
+
+    with route_lock:
+        if route_rows:
+            return
+
+        created = []
+        try:
+            for family in (AF_INET, AF_INET6):
+                luid, if_index = route_interfaces[family]
+                for address, prefix_length in _ROUTE_PREFIXES[family]:
+                    key = _route_key(
+                        family,
+                        address,
+                        prefix_length,
+                    )
+                    row = _build_sink_row(
+                        family,
+                        luid,
+                        if_index,
+                        address,
+                        prefix_length,
+                    )
+                    code = iphlpapi.CreateIpForwardEntry2(
+                        ctypes.byref(row)
+                    )
+                    if code not in (0, ERROR_ROUTE_EXISTS, ERROR_OBJECT_ALREADY_EXISTS):
+                        _route_error(
+                            code,
+                            f"创建断网路由 {family}/{prefix_length}",
+                        )
+                    route_rows[key] = row
+                    created.append(key)
+        except Exception:
+            for key in reversed(created):
+                row = route_rows.get(key)
+                if row is not None:
+                    iphlpapi.DeleteIpForwardEntry2(
+                        ctypes.byref(row)
+                    )
+                    route_rows.pop(key, None)
+            raise
+
+
+def _delete_sink_routes():
+    with route_lock:
+        if not route_rows:
+            return
+
+        errors = []
+        for key, row in list(route_rows.items()):
+            code = iphlpapi.DeleteIpForwardEntry2(
+                ctypes.byref(row)
+            )
+            if code not in (0, ERROR_FILE_NOT_FOUND):
+                errors.append((key, code))
+            else:
+                route_rows.pop(key, None)
+
+        if errors:
+            details = "; ".join(
+                f"{key}: {code}"
+                for key, code in errors
+            )
+            raise OSError(
+                "恢复网络时删除断网路由失败: " + details
             )
 
 
-def cleanup_firewall_rules():
-    global firewall_ready
+def set_route_network_state(enabled):
+    """True=断网，False=恢复；热路径只调用 IP Helper Native API。"""
+    if enabled:
+        _create_sink_routes()
+    else:
+        _delete_sink_routes()
 
-    if not firewall_ready:
-        return True
 
+def cleanup_route_control():
+    global route_ready
     try:
-        _com_set_firewall_state(False)
-        firewall_ready = True
+        _delete_sink_routes()
+        route_ready = True
         return True
     except Exception:
-        try:
-            run_powershell(
-                f"Set-NetFirewallRule "
-                f"-Name '{RULE_OUT}','{RULE_IN}' "
-                f"-Enabled False "
-                f"-ErrorAction SilentlyContinue"
-            )
-            firewall_ready = True
-            return True
-        except Exception:
-            firewall_ready = False
-            return False
-
-
-def set_firewall_state(enabled):
-    global firewall_ready
-
-    if not firewall_ready:
-        if not prepare_firewall_rules():
-            raise RuntimeError(
-                "无法准备 Windows 防火墙规则。"
-            )
-
-    try:
-        _com_set_firewall_state(bool(enabled))
-        return
-    except Exception as com_error:
-        # 仅在 COM 异常时走旧方案，保证兼容性。
-        value = "$true" if enabled else "$false"
-
-        try:
-            run_powershell(
-                f"Set-NetFirewallRule "
-                f"-Name '{RULE_OUT}','{RULE_IN}' "
-                f"-Enabled {value} "
-                f"-ErrorAction Stop"
-            )
-            return
-        except Exception as ps_error:
-            try:
-                state = "yes" if enabled else "no"
-
-                for name in (RULE_OUT, RULE_IN):
-                    run_netsh([
-                        "advfirewall",
-                        "firewall",
-                        "set",
-                        "rule",
-                        f"name={name}",
-                        "new",
-                        f"enable={state}",
-                    ])
-
-                return
-            except Exception as netsh_error:
-                raise RuntimeError(
-                    "无法切换 Windows 防火墙规则。\n"
-                    f"COM：{com_error}\n"
-                    f"PowerShell：{ps_error}\n"
-                    f"netsh：{netsh_error}"
-                )
+        return False
 
 
 def block_network():
     global offline
 
-    set_firewall_state(True)
-
+    set_route_network_state(True)
     with state_lock:
         offline = True
 
@@ -1347,8 +1103,7 @@ def block_network():
 def unblock_network():
     global offline
 
-    set_firewall_state(False)
-
+    set_route_network_state(False)
     with state_lock:
         offline = False
 
@@ -2559,7 +2314,7 @@ def request_exit():
     stop_keyboard_thread()
 
     # 无论当前 UI 状态如何，都尝试清理自己的规则。
-    cleanup_firewall_rules()
+    cleanup_route_control()
 
     user32.DestroyWindow(
         main_hwnd
@@ -2711,7 +2466,7 @@ def wnd_proc(
 
         remove_tray()
 
-        cleanup_firewall_rules()
+        cleanup_route_control()
 
         user32.PostQuitMessage(
             0
@@ -3191,7 +2946,7 @@ def main():
 
         user32.MessageBoxW(
             None,
-            "程序需要管理员权限才能控制 Windows 防火墙。\n"
+            "程序需要管理员权限才能修改 Windows IP 路由表。\n"
             "请使用管理员身份运行。",
             APP_NAME,
             MB_OK | MB_ICONERROR,
@@ -3210,15 +2965,15 @@ def main():
     load_config()
 
     # --------------------------------------------------------
-    # 启动时只准备一次防火墙规则。
-    # 已存在则直接复用，并确保初始状态为 Disabled。
+    # 启动时只发现 IPv4 / IPv6 Loopback 接口。
+    # 此阶段不修改路由表；真正断网时才创建黑洞路由。
     # --------------------------------------------------------
 
     try:
-        prepare_firewall_rules()
+        prepare_route_control()
     except Exception as error:
         show_error(
-            "防火墙初始化失败",
+            "路由控制初始化失败",
             str(error),
         )
 
@@ -3261,7 +3016,7 @@ def main():
 
         stop_keyboard_thread()
 
-        cleanup_firewall_rules()
+        cleanup_route_control()
         remove_tray()
 
         if background_brush:
